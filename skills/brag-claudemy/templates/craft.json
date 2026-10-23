@@ -1,0 +1,11 @@
+{
+  "note": "The craft manifest: the techniques from STUDY.md that this build takes. verify.py checks that each one cites a time that STUDY.md contains and that each fingerprint (a regex) is found in index.html, so a technique that was declared and not built fails. Copy this file to the project folder as craft.json and replace the example.",
+  "techniques": [
+    {
+      "id": "camera-drift",
+      "reference": "2.0 to 4.5 s",
+      "role": "the camera drifts sideways and decelerates into the hold",
+      "fingerprint": ["camera\\.position", "outCubic|easeOut"]
+    }
+  ]
+}

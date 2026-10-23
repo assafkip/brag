@@ -4,6 +4,14 @@ STATUS: {{STATUS}}
 
 (STATUS is CONCEPT when the product is not built yet, or BUILT when it exists and can be shown for real. See references/claims.md.)
 
+## Vision
+
+The person's own words about what this video is trying to be, before any constraint. Quote them, one line each, starting with `>`.
+
+> {{a line in their words}}
+
+## Brief
+
 - Subject:
 - Audience:
 - Message (one line):

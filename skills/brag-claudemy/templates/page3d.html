@@ -1,0 +1,92 @@
+<!doctype html>
+<!-- eyeball-gate-skip: video frame source rendered to mp4, not a web page -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{NAME}}</title>
+<style>
+*{box-sizing:border-box;margin:0;transition:none!important;animation:none!important}
+html,body{width:1920px;height:1080px;overflow:hidden;background:#0b1a3a}
+#stage{position:relative;width:1920px;height:1080px;overflow:hidden}
+#gl{position:absolute;inset:0;width:1920px;height:1080px}
+#caption{position:absolute;left:0;right:0;bottom:120px;text-align:center;font:600 64px -apple-system,BlinkMacSystemFont,"Helvetica Neue",sans-serif;color:#f4f6fb;letter-spacing:-.02em}
+#concept-label{position:absolute;right:72px;top:58px;font:400 24px -apple-system,sans-serif;color:#9fb0d0;z-index:9}
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="gl" width="1920" height="1080"></canvas>
+  <div id="concept-label">Concept preview</div>
+  <div id="caption"></div>
+</div>
+<script src="vendor/three.classic.js"></script>
+<script>
+/* Route R4 template. window.render(t) is a pure function of t: it sets the camera, the objects and the caption from t alone.
+   No Math.random, no real time, no CSS transitions. Replace the beats, keep the shape. */
+const SCENES = [{id: 'a', start: 0, end: 4.2}, {id: 'b', start: 4, end: 8.2}, {id: 'c', start: 8, end: 12}];
+const T = window.THREE;
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, u) => a + (b - a) * u;
+const seg = (t, a, b) => { const x = clamp((t - a) / (b - a), 0, 1); return x * x * (3 - 2 * x); };
+const outBack = (x, s = 1.7) => { x = clamp(x, 0, 1); const c = x - 1; return 1 + c * c * ((s + 1) * c + s); };
+const fract = x => x - Math.floor(x);
+const H = (i, k = 0) => fract(Math.sin((i + 1) * 127.1 + k * 311.7) * 43758.5453);   // deterministic stand-in for random
+
+const renderer = new T.WebGLRenderer({canvas: document.getElementById('gl'), antialias: true, preserveDrawingBuffer: true});
+renderer.setPixelRatio(1); renderer.setSize(1920, 1080, false); renderer.setClearColor(0x0b1a3a, 1);
+const scene = new T.Scene();
+scene.fog = new T.Fog(0x0b1a3a, 1800, 6000);                                  // depth by value: far things fade into the background
+const camera = new T.PerspectiveCamera(45, 1920 / 1080, 10, 9000);
+
+// flat vector surfaces on 3D positions, in layers at different depths (parallax)
+const panels = [];
+for (let i = 0; i < 9; i++) {
+  const w = 520 + H(i) * 380, h = 320 + H(i, 1) * 200;
+  const m = new T.Mesh(new T.PlaneGeometry(w, h), new T.MeshBasicMaterial({color: i % 3 === 0 ? 0x2f6fe4 : 0x16356f}));
+  m.userData = {x: (H(i, 2) - .5) * 2600, y: (H(i, 3) - .5) * 1100, z: -i * 420, arrive: i * .25};
+  scene.add(m); panels.push(m);
+}
+// dots drifting at the frame edges, never still
+const dots = [];
+for (let i = 0; i < 60; i++) {
+  const m = new T.Mesh(new T.CircleGeometry(6 + H(i, 5) * 10, 16), new T.MeshBasicMaterial({color: 0xcfe0ff, fog: false}));
+  m.userData = {x: (H(i, 6) - .5) * 3400, y: (H(i, 7) - .5) * 1800, z: -H(i, 8) * 1800, v: 40 + H(i, 9) * 120};
+  scene.add(m); dots.push(m);
+}
+// one panel that morphs from one idea into the next instead of a cut
+const hero = new T.Mesh(new T.PlaneGeometry(640, 400), new T.MeshBasicMaterial({color: 0xffffff}));
+scene.add(hero);
+const caption = document.getElementById('caption');
+const CAPTION = 'One idea, then the next.';
+
+window.render = function (t) {
+  // a perspective camera that always moves: slow drift plus a pull-back that decelerates
+  const pull = seg(t, 4, 8);
+  camera.position.set(Math.sin(t * .35) * 220, Math.cos(t * .27) * 90, lerp(900, 1500, pull) - t * 18);
+  camera.lookAt(Math.sin(t * .2) * 80, 0, -1200);
+  camera.updateMatrixWorld();
+  for (const p of panels) {
+    const u = p.userData, a = outBack((t - u.arrive) / 1.1);
+    p.position.set(u.x + (1 - a) * 2200, u.y + Math.sin(t * .8 + u.z) * 12, u.z - (1 - a) * 1500);
+    p.rotation.y = (1 - a) * .7 + Math.sin(t * .5 + u.x) * .03;
+    p.visible = a > .001;
+  }
+  for (const d of dots) {
+    const u = d.userData;
+    d.position.set(((u.x + t * u.v + 1700) % 3400) - 1700, u.y + Math.sin(t + u.z) * 8, u.z);
+  }
+  // morph: the hero panel changes position, size and colour across 8 to 10 s, so one object carries the change
+  const m = seg(t, 8, 10);
+  hero.position.set(lerp(-700, 0, m), lerp(200, -40, m), lerp(-300, 200, m));
+  hero.scale.set(lerp(.6, 1.4, m), lerp(.6, 1.2, m), 1);
+  hero.material.color.setRGB(lerp(.18, .95, m), lerp(.42, .96, m), lerp(.9, 1, m));
+  hero.visible = t > 7.8;
+  // caption writing in, letter by letter, from a time
+  const n = Math.floor(clamp((t - 9.5) / 1.4, 0, 1) * CAPTION.length);
+  caption.textContent = CAPTION.slice(0, n);
+  renderer.render(scene, camera);
+};
+window.render(0);
+</script>
+</body>
+</html>

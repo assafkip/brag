@@ -12,7 +12,8 @@ for f in BRIEF.md DESIGN.md STORYBOARD.md SCRIPT.md; do
   sed -e "s/{{NAME}}/$NAME/g" -e "s/{{STATUS}}/$STATUS/g" "$HERE/templates/$f" > "$DIR/$f"
 done
 sed -e "s/{{NAME}}/$NAME/g" "$HERE/templates/page.html" > "$DIR/index.html"
-cp "$HERE/templates/reference.json" "$HERE/templates/audio-plan.json" "$DIR/"
+cp "$HERE/templates/reference.json" "$HERE/templates/audio-plan.json" "$HERE/templates/STUDY.md" "$HERE/templates/DIRECTIONS.md" "$DIR/"
+# craft.json (templates/craft.json) is copied by hand once STUDY.md has its techniques; page3d.html is route R4's page.
 cp "$HERE/references/rulings.md" "$DIR/rulings.md"
 if [ "$STATUS" = CONCEPT ]; then
   cat > "$DIR/rulings.json" <<'J'
