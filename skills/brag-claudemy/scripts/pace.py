@@ -78,7 +78,7 @@ def measure(path):
 def declared_scenes(project):
     """Scene table from the project's index.html (const SCENES = [{id, start, end}, ...]), or [] if absent.
 
-    The pixel detector above cannot see soft dissolves between pale scenes (on the Investigator Co-pilot cut,
+    The pixel detector above cannot see soft dissolves between pale scenes (on a product explainer cut,
     scene-change scores were at most 0.07 against a threshold of 0.2, so it counted one long shot). For a
     render(t) page the exact scene boundaries are in the page itself, so verify.py reads them from there and
     prints the detector's own count as information. Do not change a design to make the detector see cuts.

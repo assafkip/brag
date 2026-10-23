@@ -3,7 +3,7 @@
 #   mux.sh <frames-dir> <audio.wav> <out.mp4> [poster-at-seconds=11.0] [fps=30]
 # Settings are the owner's (Claudemy Sonos cut rebuild, 2026-10-23): h264 crf 17, yuv420p, AAC 192k 48 kHz,
 # loudnorm I=-16 TP=-1.5 LRA=11. The first pass measures the soundtrack, the second applies the measured values with
-# linear=true, so the result lands on -16 LUFS (a single pass landed at -17.2 on the Investigator Co-pilot cut).
+# linear=true, so the result lands on -16 LUFS (a single pass landed at -17.2 on a product explainer cut).
 # Writes <out>-poster.jpg next to the video; frame 0 of the video is that poster.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"

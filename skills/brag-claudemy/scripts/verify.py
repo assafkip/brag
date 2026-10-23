@@ -10,7 +10,15 @@ Checks (each prints PASS, FAIL or INFO):
   4 poster     <video stem>-poster.jpg exists and equals frame 0 (mean difference under 10)
   5 copy       copylint over SCRIPT.md, STORYBOARD.md and the page(s) in the project root
   6 sources    every on-screen line in SCRIPT.md carries a [src: ...] tag
-  7 concept    if BRIEF.md says STATUS: CONCEPT, SCRIPT.md has "Concept preview" and the page has id="concept-label"
+  7 concept    if BRIEF.md says STATUS: CONCEPT, SCRIPT.md has "Concept preview" and the page has id="concept-label".
+               rulings.json "waive_concept_label": "<reason>" turns a failing result into WAIVED (reason); an empty
+               reason is not a waiver and stays FAIL
+  8 chain      study, craft, directions, vision, critique, readers (scripts/chain_checks.py). WARN when a required
+               file is missing, INFO when an opt-in file is missing, FAIL when a file exists and its claims do not hold
+
+Statuses: PASS, FAIL, WARN, WAIVED, INFO. Only FAIL fails the run. After the run it writes <video>.receipt.json
+(the video's sha256 and every status). `verify.py <video> --check-receipt` exits 0 only if that receipt matches
+the video as it is now and holds no FAIL: the check to run before showing the video to anyone.
 
 It prints what it did NOT verify, so a clean run is never read as more than it is.
 """
@@ -19,11 +27,13 @@ import json
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import chain_checks  # noqa: E402
 import copylint  # noqa: E402
 import pace  # noqa: E402
 
@@ -57,8 +67,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("video")
     ap.add_argument("--project", default=".")
+    ap.add_argument("--check-receipt", action="store_true")
     a = ap.parse_args()
     v, proj = Path(a.video), Path(a.project)
+    if a.check_receipt:
+        return check_receipt(v)
 
     # 1 file
     try:
@@ -123,7 +136,7 @@ def main():
         add("poster", "FAIL", f"{poster.name} not found")
 
     # 5 copy
-    files = [p for p in (proj / "SCRIPT.md", proj / "STORYBOARD.md") if p.exists()] + sorted(proj.glob("*.html"))
+    files = [p for p in (proj / "SCRIPT.md", proj / "STORYBOARD.md", proj / "narration.txt") if p.exists()] + sorted(proj.glob("*.html"))
     rl = json.load(open(proj / "rulings.json")) if (proj / "rulings.json").exists() else {}
     found = [(f, i) for f, items in copylint.lint_files(files, rl).items() for i in items]
     add("copy", "FAIL" if found else "PASS", f"{len(files)} file(s) linted" + ("; " + "; ".join(f"{Path(f).name}:{n} {r}" for f, (n, r, _) in found[:4]) if found else ""))
@@ -147,21 +160,59 @@ def main():
     if re.search(r"^STATUS:\s*CONCEPT", brief, re.M):
         script_ok = sc.exists() and "Concept preview" in sc.read_text()
         page_ok = any('id="concept-label"' in p.read_text() for p in proj.glob("*.html"))
-        add("concept", "PASS" if script_ok and page_ok else "FAIL", f"script label {'yes' if script_ok else 'MISSING'}, page label element {'yes' if page_ok else 'MISSING'}")
+        detail = f"script label {'yes' if script_ok else 'MISSING'}, page label element {'yes' if page_ok else 'MISSING'}"
+        waive = rl.get("waive_concept_label")
+        if script_ok and page_ok:
+            add("concept", "PASS", detail)
+        elif isinstance(waive, str) and waive.strip():
+            add("concept", "WAIVED", f"({waive.strip()}) {detail}")
+        elif "waive_concept_label" in rl:
+            add("concept", "FAIL", f"{detail}; waive_concept_label needs a non-empty reason string, so it waives nothing")
+        else:
+            add("concept", "FAIL", detail)
     else:
         add("concept", "INFO", "BRIEF.md does not say STATUS: CONCEPT")
-    return finish()
+
+    # 8 chain
+    for name, status, detail in chain_checks.run_all(proj, v):
+        add(name, status, detail)
+    return finish(v)
 
 
-def finish():
+def check_receipt(v):
+    r = v.with_name(v.stem + ".receipt.json")
+    if not r.exists():
+        print(f"NO RECEIPT: {r.name} not found. Run verify.py on this video first.")
+        return 1
+    rec = json.loads(r.read_text())
+    if rec.get("video_sha256") != chain_checks.sha256(v):
+        print("STALE RECEIPT: the video changed after it was verified. Run verify.py again.")
+        return 1
+    if rec.get("fail"):
+        print(f"RECEIPT HOLDS {rec['fail']} FAIL: not ready to show.")
+        return 1
+    print(f"RECEIPT OK: {rec['written']} for this exact video, no FAIL.")
+    return 0
+
+
+def finish(video=None):
     w = max(len(r[0]) for r in rows)
     for n, s, d in rows:
-        print(f"{n:<{w}}  {s:<5}  {d}")
-    fails = sum(1 for r in rows if r[1] == "FAIL")
-    print(f"\nSUMMARY: {sum(1 for r in rows if r[1] == 'PASS')} PASS, {fails} FAIL, {sum(1 for r in rows if r[1] == 'INFO')} INFO")
+        print(f"{n:<{w}}  {s:<6} {d}")
+    count = {k: sum(1 for r in rows if r[1] == k) for k in ("PASS", "FAIL", "WARN", "WAIVED", "INFO")}
+    print(f"\nSUMMARY: {count['PASS']} PASS, {count['FAIL']} FAIL, {count['WARN']} WARN, {count['WAIVED']} WAIVED, {count['INFO']} INFO")
     print("NOT VERIFIED by this script: visual quality and taste, whether each claim is true beyond its [src:] tag, brand fidelity,")
     print("that the concept label is visible in every frame, music and sound design, whether speech ends on a natural pause.")
-    return 1 if fails else 0
+    print("A run with no FAIL is necessary, not proof the look is right: look at the video (rulings.md, ruling 25).")
+    if video is not None:
+        try:
+            rec = {"video": Path(video).name, "video_sha256": chain_checks.sha256(video), "fail": count["FAIL"],
+                   "written": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   "checks": [{"name": n, "status": s} for n, s, _ in rows]}
+            Path(video).with_name(Path(video).stem + ".receipt.json").write_text(json.dumps(rec, indent=2))
+        except OSError as e:
+            print(f"(could not write receipt: {e})")
+    return 1 if count["FAIL"] else 0
 
 
 if __name__ == "__main__":
