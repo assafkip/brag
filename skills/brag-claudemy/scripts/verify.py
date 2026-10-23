@@ -93,11 +93,24 @@ def main():
     ref = proj / "reference.json"
     if ref.exists():
         s = pace.measure(str(v))
-        res = pace.compare(s, json.load(open(ref)))
-        bad = [r for r in res if not r[3]]
-        add("pace", "FAIL" if bad else "PASS",
-            f"avg shot {s['avg_shot_s']:.2f}s, moving {s['frames_moving_pct']:.0f}%, longest still {s['longest_still_s']:.1f}s"
-            + (" | out of range: " + ", ".join(r[0] for r in bad) if bad else ""))
+        decl, note, cover_fail = pace.declared_scenes(proj), "", None
+        if decl:
+            ok_cover, why = pace.scenes_cover(decl, s["duration_s"])
+            if ok_cover:
+                n = len(decl)
+                s = {**s, "shots": n, "avg_shot_s": s["duration_s"] / n}
+                note = (f" | {n} scenes from index.html SCENES; the pixel detector sees {len(s['shot_changes_s'])} of {n - 1} changes"
+                        " (it cannot see soft dissolves between similar scenes)")
+            else:
+                cover_fail = why
+        if cover_fail:
+            add("pace", "FAIL", f"index.html SCENES table does not tile the video: {cover_fail}")
+        else:
+            res = pace.compare(s, json.load(open(ref)))
+            bad = [r for r in res if not r[3]]
+            add("pace", "FAIL" if bad else "PASS",
+                f"avg shot {s['avg_shot_s']:.2f}s, moving {s['frames_moving_pct']:.0f}%, longest still {s['longest_still_s']:.1f}s"
+                + (" | out of range: " + ", ".join(r[0] for r in bad) if bad else "") + note)
     else:
         add("pace", "INFO", "no reference.json in the project; pace measured nowhere")
 

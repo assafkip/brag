@@ -103,3 +103,51 @@ def test_verify_fails_bad_project(tmp_path):
     assert p.returncode == 1, p.stdout
     out = p.stdout
     assert "poster" in out and "FAIL" in out and "without [src" in out and "NOT VERIFIED" in out
+
+
+# ---- declared scenes: shot count comes from the page, and the scenes must tile the video -----------------
+def test_declared_scenes_and_cover(tmp_path):
+    (tmp_path / "index.html").write_text("<script>const SCENES = [{id:'s1', start: 0.0, end: 5.5},{id:'s2', start: 5.0, end: 10.5}];</script>")
+    sc = pace.declared_scenes(tmp_path)
+    assert sc == [(0.0, 5.5), (5.0, 10.5)]
+    assert pace.scenes_cover(sc, 10.5)[0]
+    assert not pace.scenes_cover([(0, 5), (8, 10)], 10)[0]        # a gap
+    assert not pace.scenes_cover([(0, 5), (1, 10)], 10)[0]        # too much overlap
+    assert not pace.scenes_cover([(2, 10)], 10)[0]                # does not start at 0
+    assert not pace.scenes_cover([(0, 5)], 10)[0]                 # does not reach the end
+
+
+def _mk_project(tmp_path, scenes_js):
+    d = tmp_path / "p"
+    subprocess.run(["bash", str(SK / "scripts" / "scaffold.sh"), str(d), "Pace", "concept"], check=True, capture_output=True)
+    page = (d / "index.html").read_text()
+    import re
+    (d / "index.html").write_text(re.sub(r"const SCENES = \[.*?\];", "const SCENES = " + scenes_js + ";", page, flags=re.S))
+    (d / "SCRIPT.md").write_text("# S\n\n## On-screen text\n\n- Scene 1 label: \"The problem\" [src: X-1]\n\nConcept preview\n")
+    vid = d / "renders" / "v.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=1920x1080:d=12:r=30", "-f", "lavfi",
+                    "-i", "sine=f=220:d=12", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(vid)], check=True)
+    return d, vid
+
+
+def test_verify_pace_uses_declared_scenes_and_refuses_a_bad_table(tmp_path):
+    good, vid = _mk_project(tmp_path, "[{id:'a',start:0,end:4.2},{id:'b',start:4,end:8.2},{id:'c',start:8,end:12}]")
+    out = subprocess.run([sys.executable, str(SK / "scripts" / "verify.py"), str(vid), "--project", str(good)], capture_output=True, text=True).stdout
+    line = next(l for l in out.splitlines() if l.startswith("pace"))
+    assert "PASS" in line and "3 scenes from index.html" in line, out       # 12 s / 3 scenes = 4.0 s, inside 3.5 to 4.8
+    bad, vid2 = _mk_project(tmp_path / "x", "[{id:'a',start:0,end:3},{id:'b',start:6,end:12}]")   # a 3 second gap
+    out2 = subprocess.run([sys.executable, str(SK / "scripts" / "verify.py"), str(vid2), "--project", str(bad)], capture_output=True, text=True).stdout
+    assert next(l for l in out2.splitlines() if l.startswith("pace")).split()[1] == "FAIL", out2
+
+
+# ---- mux.sh: two-pass loudness lands on target ----------------------------------------------------------
+def test_mux_lands_on_minus_16(tmp_path):
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    ff("-f", "lavfi", "-i", "testsrc2=s=320x180:d=4:r=30", str(frames / "%05d.png"))
+    ff("-f", "lavfi", "-i", "sine=f=330:d=4", "-af", "volume=0.35", "-ar", "48000", "-ac", "2", str(tmp_path / "a.wav"))
+    out = tmp_path / "o.mp4"
+    subprocess.run(["bash", str(SK / "scripts" / "mux.sh"), str(frames), str(tmp_path / "a.wav"), str(out), "1.0"], check=True, capture_output=True)
+    import verify
+    ld = verify.loudness(str(out))
+    assert abs(float(ld["input_i"]) + 16) < 0.7, ld

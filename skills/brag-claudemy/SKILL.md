@@ -1,5 +1,5 @@
 ---
-name: brag-claudemy
+name: brag
 description: Make a short product video, about 25 to 30 seconds, from a brief, a spec or a real product, using the founder's own method from the Claudemy videos. It writes the brief and rulings first, measures a reference video for pace, designs and storyboards every scene with a source tag on every line, builds a rendered-frame page (or generated shots, or Hyperframes beats), makes a calm soundtrack, renders, and then runs a verifier that checks loudness, pace, copy rules, sources and the poster frame. It never spends money without an approved line and never shows a concept as if it were working software. Use when someone asks for a measured, source-tagged or concept-labelled product video, says "the Claudemy method", "brag-claudemy", or "build a video from this spec", or wants pace measured against a reference. For a quick one-command launch video of a built project, the plain brag skill is the lighter choice.
 license: MIT
 ---
@@ -23,7 +23,7 @@ Check and say in one line what is missing: `ffmpeg`, `ffprobe`, `python3` with `
 
 2. **Brief.** Fill BRIEF.md with the user. Add forbidden words (client names, confidential material) to rulings.json. If the user gives a ruling at any point, append it to rulings.md (and rulings.json if a script can check it) in that same turn, before acting on it.
 
-3. **Reference.** Ask for a reference video. If a local clip exists, run `python3 <skill>/scripts/pace.py <reference.mp4> --json` and write the targets into reference.json. If not, keep the template (Sonos, measured 2026-10-23) and say so. The done-means is these numbers, set before building.
+3. **Reference.** Ask for a reference video. If a local clip exists, run `python3 <skill>/scripts/pace.py <reference.mp4> --json` and write the targets into reference.json. If not, keep the template (Sonos, measured 2026-10-23), write in BRIEF.md that the numbers come from the owner's notes and were not re-measured, and say so in the report. The done-means is these numbers, set before building.
 
 4. **Design.** DESIGN.md. BUILT: from the real product's captured design. CONCEPT: a proposal; the founder picks. Say what the look is not.
 
@@ -37,7 +37,7 @@ Check and say in one line what is missing: `ffmpeg`, `ffprobe`, `python3` with `
 
 7. **Build.** Follow the route file. Render stills first and look at every one. Fix what you see before the full render. Then `python3 <skill>/scripts/audio.py audio-plan.json` and `bash <skill>/scripts/mux.sh frames soundtrack.wav renders/<name>.mp4 <poster-seconds>`.
 
-8. **Verify.** `python3 <skill>/scripts/verify.py renders/<name>.mp4 --project .`. Fix every FAIL. Re-measure after each round and compare to the reference, not to the last attempt. At most three rounds on one class of fix; if the same failure happens twice, stop and diagnose before a third try. Then report.
+8. **Verify.** `python3 <skill>/scripts/verify.py renders/<name>.mp4 --project .`. Fix every FAIL. Re-measure after each round and compare to the reference, not to the last attempt. verify.py counts shots from the SCENES table in index.html, because the pixel detector cannot see soft dissolves between similar scenes; it prints the detector's own count as information. Never change the design (cuts, backgrounds, card sizes) to make a detector see a transition: if a check cannot measure something your design does on purpose, report the limit. At most three rounds on one class of fix; if the same failure happens twice, stop and diagnose before a third try. Then report.
 
 9. **Share copy.** Write it in SCRIPT.md under "Share copy". Short, plain, no claim without a source tag. Add any music credit line.
 

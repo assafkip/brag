@@ -7,7 +7,7 @@ set -euo pipefail
 DIR="${1:?project dir}"; NAME="${2:?name}"; MODE="${3:-concept}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 case "$MODE" in concept) STATUS=CONCEPT;; built) STATUS=BUILT;; *) echo "mode must be concept or built" >&2; exit 2;; esac
-mkdir -p "$DIR"/{assets,shots,motion/clips,motion/in,frames,renders}
+mkdir -p "$DIR"/{assets,frames,renders}   # route R2 (generated shots) adds shots/ and motion/ when it starts
 for f in BRIEF.md DESIGN.md STORYBOARD.md SCRIPT.md; do
   sed -e "s/{{NAME}}/$NAME/g" -e "s/{{STATUS}}/$STATUS/g" "$HERE/templates/$f" > "$DIR/$f"
 done

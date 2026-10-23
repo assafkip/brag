@@ -5,9 +5,9 @@
 <meta charset="utf-8">
 <title>{{NAME}}</title>
 <style>
-:root{--ink:#1b1f24;--paper:#f4f2ee;--label:#8a857d;--accent:#2e7d5b;
+:root{--ink:#1b1f24;--paper:#f4f2ee;--label:#4f4a43;--accent:#2e7d5b;
 --sans:-apple-system,BlinkMacSystemFont,"SF Pro Display","Helvetica Neue",sans-serif;
---mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+--mono:Menlo,Monaco,"Courier New",monospace}
 *{box-sizing:border-box;margin:0;transition:none!important;animation:none!important}
 html,body{width:1920px;height:1080px;overflow:hidden;background:#000}
 #stage{position:relative;width:1920px;height:1080px;overflow:hidden;background:var(--paper)}
@@ -16,7 +16,8 @@ html,body{width:1920px;height:1080px;overflow:hidden;background:#000}
 .t{position:absolute;font:500 70px/1.08 var(--sans);letter-spacing:-.025em;color:var(--ink);opacity:0;white-space:nowrap}
 .t.small{font-size:40px;font-weight:400;letter-spacing:-.01em}
 .t.mono{font:500 34px var(--mono);letter-spacing:0}
-/* shown on every scene when STATUS is CONCEPT; remove the element when the product is real */
+/* shown on every scene when STATUS is CONCEPT; remove the element when the product is real.
+   Keep every card at least 100px below the top edge, even at the end of a push, so nothing touches it. */
 #concept-label{position:absolute;right:72px;top:58px;font:400 24px var(--sans);color:var(--label);z-index:9}
 </style>
 </head>
@@ -37,7 +38,11 @@ html,body{width:1920px;height:1080px;overflow:hidden;background:#000}
 
 <script>
 /* window.render(t) draws the frame for time t. It must be a pure function of t: no real time, no Math.random,
-   no CSS transitions or animations. The same t gives the same pixels. */
+   no CSS transitions or animations. The same t gives the same pixels.
+
+   SCENES is read by scripts/verify.py: it counts the shots from this table, because the pixel detector cannot
+   see soft dissolves between similar scenes. Keep it exact. The scenes must tile the video: the first starts
+   at 0, the last ends at the video's end, no gaps, overlaps (dissolves) of at most 1 second. */
 const SCENES = [
   {id: 's1', start: 0.0, end: 5.5},
   {id: 's2', start: 5.0, end: 10.5}
@@ -45,6 +50,19 @@ const SCENES = [
 const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
 const ease = x => x * x * (3 - 2 * x);
 const seg = (t, a, b) => ease(clamp((t - a) / (b - a), 0, 1));   // 0 before a, 1 after b, smooth between
+const lerp = (a, b, u) => a + (b - a) * u;
+/* A cursor that travels along waypoints [{t, x, y}, ...]; returns {x, y} at time t, easing between points. */
+const cursor = (t, pts) => {
+  if (t <= pts[0].t) return {x: pts[0].x, y: pts[0].y};
+  for (let i = 1; i < pts.length; i++) {
+    if (t <= pts[i].t) {
+      const u = seg(t, pts[i - 1].t, pts[i].t);
+      return {x: lerp(pts[i - 1].x, pts[i].x, u), y: lerp(pts[i - 1].y, pts[i].y, u)};
+    }
+  }
+  const p = pts[pts.length - 1];
+  return {x: p.x, y: p.y};
+};
 
 window.render = function (t) {
   for (const s of SCENES) {

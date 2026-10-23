@@ -4,7 +4,7 @@
 
 A JSON plan (templates/audio-plan.json) drives a calm piano bed that changes chord with the shots, near-silent foley under on-screen actions, an optional real voice clip with the music ducked under it, fades, and a peak limit. Only numpy and ffmpeg. Chords available: F, Dm, Bb, C, Am, Gm, Em; add more in the plan under "chords" and "roots".
 
-- bed: one entry per chord change, with optional "bass" and "arp". Bass enters on the reveal. A slow arpeggio plays once the product is on screen.
+- bed: one entry per chord change, with optional "bass" and "arp". Bass enters on the reveal. A slow arpeggio plays once the product is on screen. To give each scene its own chord, set one bed entry per scene at the scene's start time from the SCENES table (for example scenes at 0, 4.5, 9, 14, 19, 23.5 give six entries), and set "total" to the video's length.
 - foley: soft ticks, a stamp, a click. Barely there. No sound on text reveals.
 - ring: a final note timed to the last word of the voice, or the end card.
 - voice: file, start, length, at. Use real audio only.

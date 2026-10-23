@@ -25,6 +25,8 @@ import re
 import subprocess
 import sys
 
+from pathlib import Path
+
 import numpy as np
 
 FPS, WIDTH, THR = 10, 160, 0.5
@@ -71,6 +73,40 @@ def measure(path):
     stats.update({"duration_s": dur, "shot_changes_s": changes, "shots": len(changes) + 1,
                   "avg_shot_s": dur / (len(changes) + 1)})
     return stats
+
+
+def declared_scenes(project):
+    """Scene table from the project's index.html (const SCENES = [{id, start, end}, ...]), or [] if absent.
+
+    The pixel detector above cannot see soft dissolves between pale scenes (on the Investigator Co-pilot cut,
+    scene-change scores were at most 0.07 against a threshold of 0.2, so it counted one long shot). For a
+    render(t) page the exact scene boundaries are in the page itself, so verify.py reads them from there and
+    prints the detector's own count as information. Do not change a design to make the detector see cuts.
+    """
+    page = Path(project) / "index.html"
+    if not page.exists():
+        return []
+    m = re.search(r"const\s+SCENES\s*=\s*\[(.*?)\]\s*;", page.read_text(errors="ignore"), re.S)
+    if not m:
+        return []
+    return [(float(a), float(b)) for a, b in re.findall(r"start:\s*([0-9.]+)\s*,\s*end:\s*([0-9.]+)", m.group(1))]
+
+
+def scenes_cover(scenes, dur):
+    """The declared scenes must tile the video: start at 0, end near the end, no gaps, overlaps up to 1 s."""
+    s = sorted(scenes)
+    if not s:
+        return False, "no scenes declared"
+    if s[0][0] > 0.1:
+        return False, f"first scene starts at {s[0][0]}s, not 0"
+    if s[-1][1] < dur - 1.0:
+        return False, f"last scene ends at {s[-1][1]}s, video is {dur:.1f}s"
+    for (a0, a1), (b0, b1) in zip(s, s[1:]):
+        if b0 > a1 + 0.05:
+            return False, f"gap between {a1}s and {b0}s"
+        if a1 - b0 > 1.0:
+            return False, f"overlap of {a1 - b0:.1f}s at {b0}s"
+    return True, ""
 
 
 def compare(stats, ref):
