@@ -1,179 +1,63 @@
 ---
 name: brag
-description: Turn the current project website into a short, polished, shareable launch video using Hyperframes. Use when someone says "/brag", "let's brag about this", "make a launch video", "turn this into a video", or wants to share what they built. Reads the project code directly — no live URL or screenshots needed.
+description: Make a short product video, about 25 to 30 seconds, from a brief, a spec or a real product, using the founder's own method from the Claudemy videos. It writes the brief and rulings first, measures a reference video for pace, designs and storyboards every scene with a source tag on every line, builds a rendered-frame page (or generated shots, or Hyperframes beats), makes a calm soundtrack, renders, and then runs a verifier that checks loudness, pace, copy rules, sources and the poster frame. It never spends money without an approved line and never shows a concept as if it were working software. Use when someone asks for a measured, source-tagged or concept-labelled product video, says "the Claudemy method", "brag", or "build a video from this spec", or wants pace measured against a reference. For a quick one-command launch video of a built project, the original brag-upstream skill is the lighter choice.
+license: MIT
 ---
 
-# /brag
+# brag (the founder's product video method)
 
-You built it. Now let's brag about it.
+This is the Claudemy method, bundled. The two Claudemy videos are the worked examples (references/method.md): the app tour built from Hyperframes beats on 2026-10-15, and the Sonos cut built from generated shots, real UI and measured pace on 2026-10-23. The method is a sequence of gates, each with a file and a check. The checks are scripts, so they do not depend on you remembering them.
 
-## Invocation dispatch (must happen first)
+Scripts live in this skill's `scripts/` folder (the base directory shown when the skill loads). Call them by absolute path. Read `references/rulings.md` first: the founder's rulings override anything else.
 
-**Model check.** If you are Claude Opus 5.5 and the invocation doesn't ask for the full workflow (`--full`, "use the full brag") or for voiceover (`--voice`, which brag-slim doesn't do), switch to brag-slim: read `<skill-dir>/slim.md` (the /brag-slim skill, bundled here) and follow it for the rest of this run instead of this file. Pass along the user's input, and pass any other options (`--no-music`, `--title`, …) as plain-language direction. Tell the user in one line first, e.g. "You're on Opus 5.5, so I'm using /brag-slim: I build the whole video myself. Say 'use the full brag' to switch back." If you are any other model, or can't tell which model you are, skip this check.
+## Inputs
+- A brief in words, a spec file, or a live product URL. Ask only for what is missing.
+- Whether the product is built (STATUS: BUILT) or a concept (STATUS: CONCEPT). If unsure, it is CONCEPT. Read `references/claims.md`.
 
-Before inspecting the project, parse the complete `/brag` invocation. If the
-invocation contains `--voice`, set `voice.enabled = true`. Enable narration
-only for that run. Do not enable narration automatically and do not fall back
-to the normal no-voice workflow.
+## Before starting
+Check and say in one line what is missing: `ffmpeg`, `ffprobe`, `python3` with `numpy`, `uv`, Google Chrome installed. Rendering needs `uv run --with playwright`; tracking needs `uv run --with opencv-python-headless --with numpy`.
 
-`/brag` turns the current project website or app into a short, polished, shareable launch video using Hyperframes. It is narrow, opinionated, and fun.
+## Workflow
 
-## What this skill does
+1. **Scaffold.** `bash <skill>/scripts/scaffold.sh <project-dir> "<Name>" concept|built`. It creates BRIEF.md, rulings.md, rulings.json, DESIGN.md, STORYBOARD.md, SCRIPT.md, reference.json, audio-plan.json and index.html. Work inside the project folder from now on. Never run this skill inside a folder that holds client data, credentials or a private repo: build in a clean folder and copy in only what the video needs.
 
-1. Reads the current project code to understand the app.
-2. Plans a short brag concept specific to this project.
-3. Scripts and storyboards the video.
-4. Hands a focused composition brief to Hyperframes.
-5. Validates, renders, and writes share copy.
+2. **Brief.** Fill BRIEF.md with the user. Add forbidden words (client names, confidential material) to rulings.json. If the user gives a ruling at any point, append it to rulings.md (and rulings.json if a script can check it) in that same turn, before acting on it.
 
-## Parsing the invocation
+3. **Reference.** Ask for a reference video. Put every reference's name in reference.json under "references" (verify.py checks STUDY.md names each). If a local clip exists, run `python3 <skill>/scripts/pace.py <reference.mp4> --json` and write the targets into reference.json. If not, keep the template (Sonos, measured 2026-10-23), write in BRIEF.md that the numbers come from the owner's notes and were not re-measured, and say so in the report. The done-means is these numbers, set before building.
 
-The user may invoke with natural language or flags:
+4. **Reference forensics (required before design).** Fill STUDY.md (templates/STUDY.md, scaffolded): at least 12 techniques each with a time, frame rate and hold, easing measured by tracking one object, background, number of things on screen, what survives each shot change, and the drawing type per beat (2D flat vector, true 3D, faked depth, particles, kinetic type). Match the reference's production and not only its grammar (rulings 18, 27, 28). verify.py prints WARN, not FAIL, if STUDY.md is missing or has fewer than 12 cited techniques. Then list the techniques you will take in craft.json (templates/craft.json), each citing a time from STUDY.md with a fingerprint found in index.html.
 
-```
-/brag
-/brag --tone chaotic
-/brag --tone polished --format vertical
-/brag this. Make it feel like a ridiculous startup launch.
-```
+4b. **Design.** Fill the Vision section of BRIEF.md with the person's own words, write three directions in DIRECTIONS.md and get a pick (ruling 33). Then DESIGN.md. BUILT: from the real product's captured design. CONCEPT: a proposal; the founder picks. Say what the look is not.
 
-Parse these options:
+5. **Storyboard and script.** STORYBOARD.md (about 5 scenes of 4 to 6 seconds, a small chapter label each, one idea per scene) and SCRIPT.md. Every line under "## On-screen text" ends with `[src: id]`. If a line has no source, it does not go on screen. Show both files to the user and get the go-ahead before building.
 
-| Option | Values | Default |
-|---|---|---|
-| `--tone` | preset or freeform description | inferred |
-| `--format` | `landscape`, `vertical`, `square` | `landscape` |
-| `--duration` | seconds | auto (15-25s) |
-| `--no-music` | flag | music on |
-| `--no-sfx` | flag | sfx on |
-| `--title` | string | inferred from project |
-| `--voice` | flag | narration off |
+6. **Choose the route and say it.** Name the options and mark the pick:
+   - R1 page (default, no spend): `references/route-page.md`.
+   - R2 generated shots with motion, real UI composited: `references/route-generated.md`. Costs money; needs the spend gate.
+   - R3 Hyperframes beats: `references/route-beats.md`.
+   - R4 three.js page, for a reference with a moving perspective camera or layered depth, no spend: `references/route-3d.md`, `templates/page3d.html`, `scripts/vendor_three.sh`.
+   Read `references/spend-gate.md` before anything that costs money. No approved line in BRIEF.md "Spend approved", no spend.
 
-Voice is opt-in. If `--voice` is present, use Kokoro via Hyperframes and do
-not add any provider-selection logic. The voice workflow is intentionally
-single-provider.
+7. **Build.** Follow the route file. Prove one beat by hand, render stills first and look at every one, show them and wait (rulings 19, 20). Fix what you see before the full render. Render with `scripts/render_pipe.py` when disk is tight or the page is heavy (rulings 24). If the brief asks for narration, `scripts/voice.py` (spend gate applies). Then `python3 <skill>/scripts/audio.py audio-plan.json` and `bash <skill>/scripts/mux.sh frames soundtrack.wav renders/<name>.mp4 <poster-seconds>`.
 
-Tone can be a preset (`default`, `polished`, `yc-parody`, `chaotic`, `deadpan`, `cinematic`, `app-store`) or a creative direction such as "fake Series A launch from 2016", "museum exhibit", or "overproduced mobile game ad".
+8. **Verify.** `python3 <skill>/scripts/verify.py renders/<name>.mp4 --project .`. Fix every FAIL. Re-measure after each round and compare to the reference, not to the last attempt. verify.py counts shots from the SCENES table in index.html, because the pixel detector cannot see soft dissolves between similar scenes; it prints the detector's own count as information. Never change the design (cuts, backgrounds, card sizes) to make a detector see a transition: if a check cannot measure something your design does on purpose, report the limit. At most three rounds on one class of fix; if the same failure happens twice, stop and diagnose before a third try. Compare with the reference each round: `uv run --with numpy --with pillow python <skill>/scripts/compare.py <reference.mp4> <video>`. verify.py writes a receipt; show the video only after `verify.py <video> --check-receipt` exits 0 (ruling 36), and remember a clean run is necessary and not proof (ruling 25). Then report.
 
-When the user gives freeform tone direction, map it to the nearest preset for pacing and structure, but preserve the user's direction in the plan and composition brief.
+9. **Share copy.** Write it in SCRIPT.md under "Share copy". Short, plain, no claim without a source tag. Add any music credit line.
 
-## Narration guidance
+## Done means
+- verify.py prints no FAIL, and its "not verified" list is reported to the user as it is.
+- The founder has seen the video, not only the numbers.
+- Spend, if any, is logged in plan.md against the approved line.
 
-When `--voice` is enabled, write narration that complements the visuals, does
-not simply read visible text, matches scene pacing, sounds natural and
-conversational, and moves smoothly between scenes. Keep the script concise and
-specific to the product so the voice feels like part of the edit rather than a
-separate narration track.
+## Final report (short)
+Files and paths, the verify.py output verbatim, what was not verified, spend, rulings added this session, and the one next step.
 
----
+## Lessons from the design chain
+Rulings 27 to 38 bring in what transfers from the design-chain method: quote or time-stamp the reference, ground the build in the study, a craft manifest checked against the page, distance to the reference measured with a control, three directions, vision in the person's words, critique dispositions, a receipt before showing, independent readers, and warn-before-fail for new checks. Sources and what was not taken: `references/method.md`.
 
-## Output directory
-
-By default, output goes to `brag-output/`. To avoid overwriting previous runs, use a timestamped directory:
-
-```
-brag-output-2026-05-04-143022/
-```
-
-Use a timestamp when:
-- The user explicitly asks for a new run without overriding previous results
-- A `brag-output/` directory already exists in the project
-
-Generate the timestamp at the start of the run (`YYYY-MM-DD-HHmmss`) and use it consistently for all output paths in that run: plan, brief, composition, render, and share copy.
-
-## Skill directory
-
-`<skill-dir>` is the directory containing this `SKILL.md`. Claude Code prints it as "Base directory for this skill" when the skill loads; for other agents it's wherever the skill was installed. Bundled assets are under `<skill-dir>/assets/` and scripts under `<skill-dir>/scripts/`. Don't guess an install path: a plugin install, a `~/.claude/skills/` copy, and this repo all put it somewhere different.
-
----
-
-## Step 1: Inspect the project
-
-**Read:** [references/step-1-inspect.md](references/step-1-inspect.md)
-
-Scan the project directory and extract the information needed to plan the brag video.
-
-**Gate:** You can answer all 9 questions in the brag planning rubric.
-
----
-
-## Step 2: Plan and storyboard
-
-**Read:** [references/step-2-plan.md](references/step-2-plan.md)
-
-Write `<output-dir>/brag-plan.md` (where `<output-dir>` is `brag-output/` or the timestamped variant chosen above). Answer the planning rubric. Commit to a creative angle. Write the beat-by-beat storyboard including scenes, text, timing, transitions, and SFX cues.
-
-When music is selected, include a compact `Music cue guidance` section: read the bundled track's cue preset from `<skill-dir>/assets/music/cues/` if present, otherwise note cues will be detected at composition time (any track now supports beat sync — see `references/audio.md`). Cue metadata is optional timing guidance only: story, readability, pacing, and product clarity stay primary.
-
-**Gate:** `<output-dir>/brag-plan.md` exists with a full storyboard. Scene durations sum to 15–25 seconds.
-
----
-
-## Step 3: Hand off to Hyperframes
-
-**Read:** The Hyperframes domain skills — `hyperframes-core`, `hyperframes-animation`, `hyperframes-creative`, `hyperframes-keyframes`, `hyperframes-cli`. /brag is its own workflow: do not enter the `hyperframes` entry-point intent interview or route into its generic promo / launch-video workflow.
-**Read:** [references/step-3-compose.md](references/step-3-compose.md)
-**Read:** [references/audio.md](references/audio.md)
-
-Write the composition brief and use Hyperframes to create the video implementation in `<output-dir>/composition/`.
-
-`/brag` owns the product angle, source material, storyboard, tone, format, audio selection, music cue guidance, and delivery expectations. Hyperframes owns the concrete composition structure, exact animation timing, animation mechanics, runtime choices, linting rules, and render workflow.
-
-**Gate:** `npx hyperframes check` passes with zero errors inside `<output-dir>/composition/` (the single browser gate before render — see hyperframes-cli for what it audits).
-
----
-
-## Step 4: Validate, render, and deliver
-
-**Read:** [references/step-4-deliver.md](references/step-4-deliver.md)
-
-Validate, preview, render to `<output-dir>/brag.mp4`, pick the best poster frame into `<output-dir>/brag.jpg`, bake that poster as the video's frame 0 so it's the idle thumbnail everywhere, and write `<output-dir>/share-copy.txt`.
-
-**Gate:** `<output-dir>/brag.mp4` exists. A best-frame poster `<output-dir>/brag.jpg` is picked (not an arbitrary frame) and baked as frame 0 of `brag.mp4`. Share copy is written.
-
----
-
-## Tone system
-
-Seven tone presets ship with `/brag`. Each changes scripting energy, pacing, typography personality, and transition style. Presets are defaults, not limits.
-
-Full definitions: [references/tones.md](references/tones.md)
-
-| Tone | Energy | One-liner |
-|---|---|---|
-| `default` | Playful, clean, postable | The good-vibes default |
-| `polished` | Serious, elegant | For projects that are not jokes |
-| `yc-parody` | Deadpan startup energy | Fake seriousness applied to absurd projects |
-| `chaotic` | Fast, loud, aggressive | Over-the-top and unhinged |
-| `deadpan` | Calm, dry, understated | The joke is that nothing is a joke |
-| `cinematic` | Dramatic, trailer-scale | Big motion, bigger claims |
-| `app-store` | Smooth, feature-card clean | Corporate but not boring |
-
-Always allow a freeform creative direction to refine or override the preset.
-
----
-
-## Creative laws
-
-These apply to every brag video regardless of tone.
-
-**Short.** 15–25 seconds. Not one second more without a reason. This holds whether or not narration is on; narration does not extend the window.
-
-**Readable.** Keep the pace high through motion and cuts, never by flashing text. Every line a viewer must read holds long enough to read it (short label ~0.8s settled; a sentence ~0.3s per word). Fast-in, then hold — never fast-in, then gone.
-
-**Specific.** The video must feel like it was made for this exact project, not any project.
-
-**Show the thing.** At least one scene must display actual UI, copy, or a key visual from the product. No abstract filler.
-
-**No generic SaaS language.** "Streamline your workflow" is banned. Use the project's actual copy and claims.
-
-**The hook is everything.** The first 2 seconds determine whether someone keeps watching. Plan the hook before anything else.
-
-**Funny earns its place.** Humor should come from the project's absurdity, not from trying to be funny.
-
-**Pattern:**
-```
-Hook (2-3s) → Reveal (2-4s) → 2-3 sharp highlights (5-12s) → Punchline/outro (2-4s)
-```
-
-Adapt this. Not every project needs exactly 3 highlights. The pattern is a starting shape, not a template.
+## Hard rules
+- No emdashes, no double hyphens in visible text; `scripts/copylint.py` runs inside verify.py.
+- No narration unless the brief asks for it, then only through `scripts/voice.py` behind the spend gate. No invented quotes or testimonials; a voice that speaks for the product is its own real output.
+- Concept mode: label on every scene, invented data only, no prices, customers, or numbers about speed or accuracy.
+- Never print, copy or commit a key.
+- Nothing is published or posted by this skill.

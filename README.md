@@ -73,7 +73,7 @@ Add `-g` to install globally (available in every project); drop it to scope to t
 <summary>No installer? Copy the skill directly.</summary>
 
 ```bash
-rsync -a --exclude '.DS_Store' skills/brag/ ~/.claude/skills/brag/
+rsync -a --exclude '.DS_Store' skills/brag-upstream/ ~/.claude/skills/brag-upstream/
 rsync -a --exclude '.DS_Store' skills/brag-slim/ ~/.claude/skills/brag-slim/  # optional: the /brag-slim command
 ```
 
@@ -86,13 +86,13 @@ This repo exposes the skill at every agent's standard discovery path via symlink
 
 | Agent | How it discovers |
 |---|---|
-| **Google Antigravity** | Auto-detects from `.agents/skills/brag/` at project root or `~/.gemini/config/skills/brag/` globally |
-| **opencode** | Auto-detects from `.opencode/skills/brag/` at project root |
-| **Codex CLI** | Reads `.agents/skills/brag/`, walking up to repo root |
-| **Claude Code** | Also reads `.claude/skills/brag/` (in addition to the `.claude-plugin/` marketplace install above) |
-| **Other agents** | Point custom instructions at `skills/brag/SKILL.md` — see [`docs/other-agents.md`](docs/other-agents.md) |
+| **Google Antigravity** | Auto-detects from `.agents/skills/brag-upstream/` at project root or `~/.gemini/config/skills/brag-upstream/` globally |
+| **opencode** | Auto-detects from `.opencode/skills/brag-upstream/` at project root |
+| **Codex CLI** | Reads `.agents/skills/brag-upstream/`, walking up to repo root |
+| **Claude Code** | Also reads `.claude/skills/brag-upstream/` (in addition to the `.claude-plugin/` marketplace install above) |
+| **Other agents** | Point custom instructions at `skills/brag-upstream/SKILL.md` — see [`docs/other-agents.md`](docs/other-agents.md) |
 
-> **Windows users:** Git requires `git config core.symlinks true` (or `git clone -c core.symlinks=true`) and Windows Developer Mode or Administrator privileges to create symlinks. If symlinks don't work on your system, copy `skills/brag/` to the agent's skill directory manually instead.
+> **Windows users:** Git requires `git config core.symlinks true` (or `git clone -c core.symlinks=true`) and Windows Developer Mode or Administrator privileges to create symlinks. If symlinks don't work on your system, copy `skills/brag-upstream/` to the agent's skill directory manually instead.
 
 ## Use it
 
@@ -129,28 +129,28 @@ You get a `brag-output/` folder with the plan, a composition brief, share copy, 
 - FFmpeg on `PATH`
 - Hyperframes CLI — `npx hyperframes` (check it with `npx hyperframes doctor`)
 
-## This fork: `/brag-claudemy`
+## This fork: `/brag`
 
-This is a fork of [latent-spaces/brag](https://github.com/latent-spaces/brag) (MIT). The original skills are untouched. The fork adds one skill, `skills/brag-claudemy/`: Assaf Kipnis's own product-video method, taken from two Claudemy videos.
+This is a fork of [latent-spaces/brag](https://github.com/latent-spaces/brag) (MIT). The fork adds one skill, `skills/brag/`: Assaf Kipnis's own product-video method, taken from two Claudemy videos. The original skill moved to `skills/brag-upstream/` so two skills never share the name `brag`.
 
-`/brag` is a one-command video from a built project. `/brag-claudemy` is the slower, gated method: a brief with the owner's rulings kept in files, a reference video measured for pace, a source tag on every on-screen line, a spend gate before anything costs money, voices that are real product audio only, and a verifier script that checks loudness, pace, copy rules, sources and the poster frame. It also handles a product that is not built yet, as a labelled concept preview.
+`/brag-upstream` is the original one-command video from a built project. `/brag` is the slower, gated method: a brief with the owner's rulings kept in files, a reference video measured for pace, a source tag on every on-screen line, a spend gate before anything costs money, voices that are real product audio only, and a verifier script that checks loudness, pace, copy rules, sources and the poster frame. It also handles a product that is not built yet, as a labelled concept preview.
 
-Details: `skills/brag-claudemy/SKILL.md`. Tests: `python3 -m pytest skills/brag-claudemy/tests -q`.
+Details: `skills/brag/SKILL.md`. Tests: `python3 -m pytest skills/brag/tests -q`.
 
 ## What's in this repo
 
-- `skills/brag/` — the skill, references, and bundled music + SFX
+- `skills/brag-upstream/` — the skill, references, and bundled music + SFX
 - `skills/brag-slim/` — `/brag-slim`, the single-file skill for Claude Opus 5.5
-- `skills/brag-claudemy/`: `/brag-claudemy`, the Claudemy-method skill added in this fork
+- `skills/brag/`: `/brag`, the Claudemy-method skill added in this fork
 - `examples/` — fake product sites used as a benchmark suite
 - `docs/` — the launch site (GitHub Pages)
 - `plugin.json` — portable Agent Plugins manifest
 - `.codex-plugin/` — Codex compatibility manifest
 - `.claude-plugin/` — Claude Code manifest + shared marketplace catalog (also recognized by Codex)
-- `.claude/skills/brag/` — symlink → `skills/brag/` (Claude Code discovery)
-- `.agents/skills/brag/` — symlink → `skills/brag/` (Codex CLI + opencode discovery)
-- `.opencode/skills/brag/` — symlink → `skills/brag/` (opencode discovery)
-- `.agents/skills/brag-claudemy/` and `.opencode/skills/brag-claudemy/`: symlinks to `skills/brag-claudemy/`
+- `.claude/skills/brag-upstream/` — symlink → `skills/brag-upstream/` (Claude Code discovery)
+- `.agents/skills/brag-upstream/` — symlink → `skills/brag-upstream/` (Codex CLI + opencode discovery)
+- `.opencode/skills/brag-upstream/` — symlink → `skills/brag-upstream/` (opencode discovery)
+- `.agents/skills/brag/`, `.claude/skills/brag/` and `.opencode/skills/brag/`: symlinks to `skills/brag/`
 
 ## Credits
 
