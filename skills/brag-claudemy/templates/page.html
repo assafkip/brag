@@ -1,0 +1,64 @@
+<!doctype html>
+<!-- eyeball-gate-skip: video frame source rendered to mp4, not a web page -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{NAME}}</title>
+<style>
+:root{--ink:#1b1f24;--paper:#f4f2ee;--label:#8a857d;--accent:#2e7d5b;
+--sans:-apple-system,BlinkMacSystemFont,"SF Pro Display","Helvetica Neue",sans-serif;
+--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+*{box-sizing:border-box;margin:0;transition:none!important;animation:none!important}
+html,body{width:1920px;height:1080px;overflow:hidden;background:#000}
+#stage{position:relative;width:1920px;height:1080px;overflow:hidden;background:var(--paper)}
+.shot{position:absolute;inset:0;overflow:hidden;opacity:0}
+.label{position:absolute;left:72px;top:58px;font:400 28px var(--sans);letter-spacing:-.005em;color:var(--label)}
+.t{position:absolute;font:500 70px/1.08 var(--sans);letter-spacing:-.025em;color:var(--ink);opacity:0;white-space:nowrap}
+.t.small{font-size:40px;font-weight:400;letter-spacing:-.01em}
+.t.mono{font:500 34px var(--mono);letter-spacing:0}
+/* shown on every scene when STATUS is CONCEPT; remove the element when the product is real */
+#concept-label{position:absolute;right:72px;top:58px;font:400 24px var(--sans);color:var(--label);z-index:9}
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="concept-label">Concept preview</div>
+
+  <div class="shot" id="s1">
+    <div class="label">Label one</div>
+    <div class="t" id="t1" style="left:120px;top:420px">First line.</div>
+  </div>
+
+  <div class="shot" id="s2">
+    <div class="label">Label two</div>
+    <div class="t small" id="t2" style="left:120px;top:420px">Second line.</div>
+  </div>
+</div>
+
+<script>
+/* window.render(t) draws the frame for time t. It must be a pure function of t: no real time, no Math.random,
+   no CSS transitions or animations. The same t gives the same pixels. */
+const SCENES = [
+  {id: 's1', start: 0.0, end: 5.5},
+  {id: 's2', start: 5.0, end: 10.5}
+];
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const ease = x => x * x * (3 - 2 * x);
+const seg = (t, a, b) => ease(clamp((t - a) / (b - a), 0, 1));   // 0 before a, 1 after b, smooth between
+
+window.render = function (t) {
+  for (const s of SCENES) {
+    const el = document.getElementById(s.id);
+    const fadeIn = seg(t, s.start, s.start + 0.5), fadeOut = 1 - seg(t, s.end - 0.5, s.end);
+    el.style.opacity = clamp(Math.min(fadeIn, fadeOut), 0, 1);
+  }
+  const a = document.getElementById('t1');
+  a.style.opacity = seg(t, 0.4, 1.0);
+  a.style.transform = 'translateY(' + (1 - seg(t, 0.4, 1.0)) * 14 + 'px)';
+  const b = document.getElementById('t2');
+  b.style.opacity = seg(t, 5.4, 6.0);
+};
+window.render(0);
+</script>
+</body>
+</html>

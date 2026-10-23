@@ -129,10 +129,19 @@ You get a `brag-output/` folder with the plan, a composition brief, share copy, 
 - FFmpeg on `PATH`
 - Hyperframes CLI — `npx hyperframes` (check it with `npx hyperframes doctor`)
 
+## This fork: `/brag-claudemy`
+
+This is a fork of [latent-spaces/brag](https://github.com/latent-spaces/brag) (MIT). The original skills are untouched. The fork adds one skill, `skills/brag-claudemy/`: Assaf Kipnis's own product-video method, taken from two Claudemy videos.
+
+`/brag` is a one-command video from a built project. `/brag-claudemy` is the slower, gated method: a brief with the owner's rulings kept in files, a reference video measured for pace, a source tag on every on-screen line, a spend gate before anything costs money, voices that are real product audio only, and a verifier script that checks loudness, pace, copy rules, sources and the poster frame. It also handles a product that is not built yet, as a labelled concept preview.
+
+Details: `skills/brag-claudemy/SKILL.md`. Tests: `python3 -m pytest skills/brag-claudemy/tests -q`.
+
 ## What's in this repo
 
 - `skills/brag/` — the skill, references, and bundled music + SFX
 - `skills/brag-slim/` — `/brag-slim`, the single-file skill for Claude Opus 5.5
+- `skills/brag-claudemy/`: `/brag-claudemy`, the Claudemy-method skill added in this fork
 - `examples/` — fake product sites used as a benchmark suite
 - `docs/` — the launch site (GitHub Pages)
 - `plugin.json` — portable Agent Plugins manifest
@@ -141,6 +150,7 @@ You get a `brag-output/` folder with the plan, a composition brief, share copy, 
 - `.claude/skills/brag/` — symlink → `skills/brag/` (Claude Code discovery)
 - `.agents/skills/brag/` — symlink → `skills/brag/` (Codex CLI + opencode discovery)
 - `.opencode/skills/brag/` — symlink → `skills/brag/` (opencode discovery)
+- `.agents/skills/brag-claudemy/` and `.opencode/skills/brag-claudemy/`: symlinks to `skills/brag-claudemy/`
 
 ## Credits
 

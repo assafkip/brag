@@ -1,0 +1,7 @@
+{
+  "source": "Sonos 'Guide to Sonos System' (youtube.com/watch?v=0GoRCJgCPvI), measured 2026-10-23 with the same instrument as scripts/pace.py: average shot 4.1s (21 cuts in 90s), frames moving 66%, longest still 4.0s, mean change 4.30. Source: the owner's Claudemy notes. Replace with your own reference when you have one: python3 scripts/pace.py <reference.mp4> --json",
+  "avg_shot_s_range": [3.5, 4.8],
+  "frames_moving_pct_range": [55, 100],
+  "longest_still_s_max": 4.0,
+  "note": "The founder's first done-means capped frames moving at 75 percent. After render 1 he asked for much more movement, so the cap is gone and the floor stays."
+}

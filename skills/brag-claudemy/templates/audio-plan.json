@@ -1,0 +1,23 @@
+{
+  "total": 28.0,
+  "sr": 48000,
+  "seed": 11,
+  "out": "soundtrack.wav",
+  "peak": 0.89,
+  "bed": [
+    {"at": 0.0, "chord": "Dm"},
+    {"at": 4.5, "chord": "Bb", "bass": true},
+    {"at": 9.0, "chord": "F", "bass": true, "arp": true},
+    {"at": 14.0, "chord": "C", "bass": true, "arp": true},
+    {"at": 19.0, "chord": "Am", "bass": true, "arp": true},
+    {"at": 23.5, "chord": "F", "bass": true}
+  ],
+  "ring": {"at": 23.5, "midi": 72},
+  "foley": [
+    {"at": 5.2, "n": 1, "cut": 1800, "gain": 0.08, "dur": 0.04},
+    {"at": 12.0, "n": 1, "cut": 2200, "gain": 0.05, "dur": 0.03}
+  ],
+  "duck": {"depth": 0.6, "pre": 0.2, "post": 0.7, "release": 1.2},
+  "fade_in": 0.4,
+  "fade_out": 1.2
+}
