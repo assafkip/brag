@@ -15,6 +15,10 @@ A JSON plan (templates/audio-plan.json) drives a calm piano bed that changes cho
 - End a clip on a natural pause, after the full sentence. Never a hard stop mid-sentence.
 - Duck the music about 0.2 s before the voice and bring it back about 0.7 s after, so the hand-off has no dip. The last chord lands on the end of the last word.
 
+## Narration (only when the brief asks for it)
+
+`python3 <skill>/scripts/voice.py --voice-id <id> --dry-run` shows the request. A live run needs an approved ElevenLabs line under "Spend approved" in BRIEF.md and the key in the environment variable ELEVENLABS_API_KEY (never in a file, never on a command line). One sentence per blank-line block in narration.txt. It writes narration.mp3, narration.sentences.json (start and end seconds per sentence) and logs the characters to spend.log. Cut and duck by the sentence times, as in the voice rules above. Voice choice and settings are judged by ear; see the worked example in method.md. Adding a library voice to the account can need a permission the key does not have, even when listing voices works.
+
 ## Loudness and format
 
 - mux.sh normalises to -16 LUFS with true peak at most -1.5 dBTP, AAC 192k at 48 kHz.

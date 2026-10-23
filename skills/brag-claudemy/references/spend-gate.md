@@ -6,6 +6,7 @@ Nothing that costs money runs until BRIEF.md has an approved line under "Spend a
 
 - Still images: gpt-image-2 through scripts/gen_image.py, 1536x1024, quality high. Key read from the file named by BRAG_OPENAI_KEY_FILE (default ~/.config/brag/openai-key). Never print or copy the key.
 - Motion clips: Kling 2.6 through the Apify actor pnda/kling-video-generator, about $0.63 to $0.70 per pro-second; six 5-second clips cost about $19 to $21. A test clip cost about $3.50 to $3.80 (Kling and Hailuo H3 each).
+- Narration: ElevenLabs through scripts/voice.py, priced per character. Key from the environment variable ELEVENLABS_API_KEY only. The script refuses without an approved line that names ElevenLabs, and logs characters used to spend.log; write the actual cost against the approved line in plan.md. Re-check the plan's price before quoting a number.
 - Retired or broken: Sora 2 API (shut down 2026-09-24), Gemini image (402, credits depleted on 2026-10-23).
 
 Prices change. Re-check the actor's pricing before quoting a number.

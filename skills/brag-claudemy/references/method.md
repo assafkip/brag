@@ -30,6 +30,30 @@ A product video is a sequence of gates, each with a file and a check. The histor
 - Spend recorded: two test clips (about $3.50 to $3.80 each), six 5-second Kling clips (about $19 to $21 at $0.63 to $0.70 per second).
 - The pace instrument cited in the notes (ref/motion.py) was lost. scripts/pace.py was rebuilt and calibrated to reproduce the recorded results of renders 1 and 2.
 
+## Worked example: a product explainer matched to a reference video (route R4, 2026-10-23)
+
+- The first three builds matched the reference's beats, labels and palette and passed verify.py, and were rejected by eye each time. The measurement behind the rejection: 51 percent of frames moving against 83 percent for the reference. The reference moved a perspective camera through layered 3D panels; the builds put flat static cards on a page. Lesson: the grammar was copied and the production was not (rulings 18 and 25).
+- The fix was a study before the design (templates/STUDY.md): every technique with a time, the frame rate and holds, easing from tracking one object, how each beat is drawn (flat vector, true 3D, faked depth, particles, kinetic type), and what survives each shot change. The study showed movement on ones, ease-out with overshoot, a drawn gradient trail and not shutter blur, and a real 3D camera in some beats. Then one beat was proved by hand with three.js (route-3d.md) before the others were built.
+- A render filled the disk: hundreds of PNG frames. render_pipe.py streams frames into ffmpeg and stops under a free-space floor (ruling 24).
+- Narration, as a worked example and not a rule: the first voices tried sounded like announcers and were rejected. The person chose a conversational American male voice, ElevenLabs stability 0.40, similarity 0.75, style 0.20, speaker boost on (the defaults in scripts/voice.py). Voice settings are judged by ear: render one sentence, listen, change one setting. Reading the voice list with an API key can work while adding a library voice to the account needs a permission the key may lack, so pick from the voices the key can already list, or have the person add the voice in their account.
+- Sound: voice plus a quiet bed. The earlier cut with whooshes and clicks was not wanted (ruling 22).
+
+## Lessons from the design chain (added 2026-10-23)
+
+A design-round method in the kipi-system repository (plugins/kipi-core/commands/design-chain.md and q-system/.q-system/scripts/design-chain-gate.py) runs: vision, owners, brief with verbatim anchors, three directions, craft manifest, build, measure, critique, proof, checks, readers, seal. The parts that transfer to making a video from a reference video are rulings 27 to 38, each with its source and each held by a check in scripts/chain_checks.py, scripts/compare.py or scripts/verify.py:
+
+- Vision first, in the person's own words (34): verify.py "vision".
+- Study the reference with times (27, 28) and re-read the whole set when one is added (32): verify.py "study".
+- Three directions before a build (33): verify.py "directions".
+- A craft manifest whose techniques cite the study and are found in the page (29): verify.py "craft".
+- Measure the distance to the reference with a control (30, 31): compare.py.
+- Critique with dispositions (35): verify.py "critique".
+- Receipt before showing (36): verify.py writes it, `--check-receipt` reads it.
+- Independent readers (37): verify.py "readers".
+- New checks warn before they fail (38).
+
+Considered and not taken: "owners per decision". In the source an owner is a file the builder must have read in full this session, held by a hook that reads the session transcript; a video project has no such record to check, and its single sources (rulings.md for copy, reference.json for pace, STUDY.md for production) are already how this skill is laid out. The source's web-only measurements (CSS axes, anti-pattern browser detector) do not apply to video.
+
 ## What the history says to do
 
 - Measure the reference before building, and re-measure every round.
