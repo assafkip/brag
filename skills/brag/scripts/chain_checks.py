@@ -10,7 +10,8 @@ up with each other; none of them says the video is good (rulings.md, ruling 25).
   directions_check DIRECTIONS.md names three directions (or says it implements an approved pick)
   vision_check     BRIEF.md carries the person's own words, quoted, under a Vision heading
   critique_check   every WEAK[tag] in CRITIQUE.md has a DISPOSITION[tag] line
-  readers_check    readers.jsonl rows for THIS video, no LEAVE, at least rulings.json "readers_required" readers
+  readers_check    readers.jsonl rows for THIS video, no LEAVE, at least rulings.json "readers_required" readers,
+                   and each row's retell coverage (retell_matched out of retell_total narration lines)
 
 A missing file is WARN for the steps the method requires (study, craft, directions, vision) and INFO for
 opt-in ones (critique, readers). A gate that is red on every older project gets switched off, so a new
@@ -166,6 +167,30 @@ def critique_check(proj):
     return "PASS", f"{len(weak)} weakness(es), each with a disposition"
 
 
+def retell_coverage(rows):
+    """(matched, total, rows missing the pair, rows whose pair is impossible) over reader rows.
+
+    Why the check reads this: five readers shown silent contact sheets of the openwitness cut
+    retold the whole story correctly and still said LEAVE, mostly "leans on the narration" or
+    "product arrives late" -- the narration carried the beat they said was missing. The retell is
+    the useful instrument; a STAY or LEAVE verdict reached without the audio is not (ASK-3036).
+    So each row records how many narration lines the reader's retell covered, next to the verdict.
+    """
+    matched = total = 0
+    missing, impossible = [], []
+    for r in rows:
+        who = str(r.get("reader"))
+        m, t = r.get("retell_matched"), r.get("retell_total")
+        if m is None or t is None:
+            missing.append(who)
+            continue
+        if not isinstance(m, int) or not isinstance(t, int) or t <= 0 or not 0 <= m <= t:
+            impossible.append(f"{who} ({m} of {t})")
+            continue
+        matched, total = matched + m, total + t
+    return matched, total, sorted(set(missing)), sorted(set(impossible))
+
+
 def readers_check(proj, video=None):
     rl = {}
     if (Path(proj) / "rulings.json").exists():
@@ -192,7 +217,15 @@ def readers_check(proj, video=None):
         return "FAIL", f"reader(s) {who} would leave"
     if len(ids) < int(need):
         return "FAIL", f"{len(ids)} reader(s) on this exact video, {need} required (rows for an older render do not count)"
-    return "PASS", f"{len(ids)} independent reader(s), none would leave"
+    judged = [r for r in mine if r.get("verdict") in ("STAY", "LEAVE")]
+    matched, total, missing, impossible = retell_coverage(judged)
+    if impossible:
+        return "FAIL", f"retell coverage is not a count of narration lines matched out of the total: {impossible}"
+    cover = f"retell coverage {matched}/{total}" if total else "no retell coverage recorded"
+    if missing:
+        return "WARN", (f"{len(ids)} independent reader(s), none would leave; {cover}, but reader(s) {missing} record no"
+                        " retell coverage, so their verdict was reached without the narration (references/reader-brief.md)")
+    return "PASS", f"{len(ids)} independent reader(s), none would leave; {cover}"
 
 
 def run_all(proj, video=None):

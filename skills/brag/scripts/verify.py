@@ -6,7 +6,9 @@
 Checks (each prints PASS, FAIL or INFO):
   1 file       h264 video, AAC audio, 1920x1080, duration within the BRIEF target if it states one
   2 loudness   integrated loudness within 1.5 LU of -16 LUFS, true peak at most -1.0 dBTP
-  3 pace       against <project>/reference.json (avg shot, frames moving, longest still)
+  3 pace       against <project>/reference.json (avg shot, AREA moving, longest area still). The motion gate
+               reads the per-tile instrument; the whole-frame mean follows as a separate INFO row
+  3b whole-frame  the whole-frame mean change, moving share and longest still, as information only
   4 poster     <video stem>-poster.jpg exists and equals frame 0 (mean difference under 10)
   5 copy       copylint over SCRIPT.md, STORYBOARD.md and the page(s) in the project root
   6 sources    every on-screen line in SCRIPT.md carries a [src: ...] tag
@@ -122,8 +124,11 @@ def main():
             res = pace.compare(s, json.load(open(ref)))
             bad = [r for r in res if not r[3]]
             add("pace", "FAIL" if bad else "PASS",
-                f"avg shot {s['avg_shot_s']:.2f}s, moving {s['frames_moving_pct']:.0f}%, longest still {s['longest_still_s']:.1f}s"
+                f"avg shot {s['avg_shot_s']:.2f}s, area moving {s['area_moving_pct']:.0f}%, longest area still {s['longest_area_still_s']:.1f}s"
                 + (" | out of range: " + ", ".join(r[0] for r in bad) if bad else "") + note)
+        add("whole-frame", "INFO",
+            f"mean change {s['mean_change']:.2f}, moving {s['frames_moving_pct']:.0f}%, longest still {s['longest_still_s']:.1f}s"
+            " (not a gate: a mean over the whole frame cannot see small-area motion on a flat page, ASK-3036)")
     else:
         add("pace", "INFO", "no reference.json in the project; pace measured nowhere")
 
