@@ -1,0 +1,322 @@
+#!/bin/bash
+# FLEET open-loops heartbeat (launchd-fired). One job sweeps every registered instance
+# (+ the skeleton). For each instance that has open [needs you] loops, it wakes a
+# HEADLESS agent (claude -p) IN that instance to advance/close them. Safe by construction:
+#   - Only wakes an agent for instances that actually have open work (cheap no-op otherwise).
+#   - The agent prompt forbids pushing to an external repo without clear maintainer approval;
+#     destructive ops stay blocked by each instance's PreToolUse hooks.
+#   - 30-min timeout per instance so a runaway agent can't spin forever.
+#   - Slacks the founder on agent failure (via slack-notify.sh); logs every run centrally.
+#   - Writes a structured run-log and self-audits post-sweep (run-step-audit.py).
+# Disable: launchctl unload ~/Library/LaunchAgents/com.kipi.openloops-heartbeat.plist
+set -uo pipefail
+
+# Default the repo root to this script's location (q-system/.q-system/scripts ->
+# three levels up), so the skeleton carries no hardcoded home path. Override
+# with KIPI_REPO if the script is relocated.
+SKEL="${KIPI_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
+REGISTRY="$SKEL/instance-registry.json"
+LOG="$SKEL/q-system/output/open-loops-heartbeat.log"
+RUNLOG="$SKEL/q-system/output/heartbeat-run-last.json"
+RUNLOG_TMP="$RUNLOG.steps.tmp"
+TS() { date '+%Y-%m-%d %H:%M:%S'; }
+
+# Failures observed during this sweep. The script used to end in an
+# unconditional `exit 0`, so launchd recorded a clean run even when an
+# instance's agent died -- which made fleet-health-daily.py's `launchd-failing`
+# detector structurally blind to this job and left its failures in Slack and a
+# freeform log, never in Linear (ASK-184). The exit code IS the wire to Linear:
+# non-zero here -> LastExitStatus non-zero -> a deduped Linear issue on the next
+# fleet-health run. Counted, not `set -e`, so one bad instance still lets the
+# rest of the fleet sweep finish.
+SWEEP_FAILURES=0
+
+# Single-writer chokepoint for the structured run-log (2026-07-01: the freeform
+# .log was unauditable -- a sweep could miss instances and nothing diffed
+# expected-vs-actual; run-step-audit.py now does, post-sweep).
+# --- environmental classification (ASK-869) ---------------------------------
+# Set once the machine-wide condition is seen; every later instance is then
+# skipped without waking an agent. Empty means the sweep is healthy.
+ENV_HALT=""
+
+# ONE CLASSIFIER, THE WORKER'S (PR #421 round 16, minor). This file kept its own
+# copy: line-anchored, fence-stripped, and missing the 529 marker the worker's lib
+# learned from the 2026-08-18 log, so a real overload filed one ticket per
+# instance here while the worker halted cleanly. env-failure-lib.sh's rule is
+# stricter than the copy's anchor and fence strip together (EVERY non-blank line
+# must be the machine's), so agent prose quoting a marker, fenced or not, still
+# cannot halt the sweep. Sourced from beside this script, never from $SKEL: a
+# KIPI_REPO override points $SKEL at another tree.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env-failure-lib.sh"
+
+log_step() {  # log_step <instance-name> <completed|skipped|failed> [note]
+  python3 -c '
+import json, sys
+print(json.dumps({"id": sys.argv[1], "status": sys.argv[2], "note": sys.argv[3] if len(sys.argv) > 3 else ""}))
+' "$1" "$2" "${3:-}" >> "$RUNLOG_TMP"
+}
+
+# --- the private copy of an agent run, and its one deletion point -------------
+# work_instance captures each agent's output to a temp file so the environmental
+# classifier reads THIS run and not a shared log (see the comment at the capture
+# site). The file is that agent's verbatim output, so it must not outlive the
+# decision it exists for. ONE function deletes it, called on the normal path, and
+# an EXIT trap catches the ways a run can leave without reaching that call --
+# `exit 0` from a later guard, or the sweep dying between mktemp and the read.
+AGENT_TMP=""
+_drop_agent_tmp() {
+  [ -n "${AGENT_TMP:-}" ] || return 0
+  rm -f "$AGENT_TMP" 2>/dev/null || true
+  AGENT_TMP=""
+}
+trap _drop_agent_tmp EXIT
+
+command -v claude >/dev/null 2>&1 || { echo "$(TS) heartbeat: no claude CLI -> skip" >> "$LOG"; exit 0; }
+# Founder decision 2026-08-01: pin the per-instance agents' model; unpinned they
+# ride the interactive default (Fable on 2026-08-01) and burn quota unattended.
+export ANTHROPIC_MODEL="claude-opus-5"
+if command -v timeout >/dev/null 2>&1; then TO="timeout 1800"
+elif command -v gtimeout >/dev/null 2>&1; then TO="gtimeout 1800"
+else TO=""; fi
+
+# Per-instance prompt. $1=abs path to open-loops.py, $2=abs qroot (controlled paths,
+# no shell-special chars), so the unquoted heredoc only substitutes those two.
+build_prompt() {
+  cat <<PROMPT_EOF
+Autonomous open-loops heartbeat for THIS instance. Be terse; act only on what is actionable.
+1. Run: python3 "$1" --report   then read the registry at $2/memory/open-loops.json
+2. For EACH loop tagged [needs you], do the next concrete action toward closure, then update that loop in $2/memory/open-loops.json (set status "closed" with a note/URL when done):
+   - OSS PR waiting on a maintainer: check via gh (gh issue view <n> --repo <r> --json comments,state ; gh pr list). Push the PR ONLY if a maintainer has clearly approved/invited it (follow the loop's next_action). No clear approval -> do nothing, leave it open.
+   - Internal work in this instance: drive it through prd-os in full (PRD -> review -> tests -> blast radius -> closeout), making all triage/approve/merge decisions yourself per the autonomy contract.
+3. Hard limits: no force-push, no git reset --hard, no branch deletion, no destructive ops, and NEVER publish to an external repo without clear maintainer approval. When unsure, do nothing.
+4. Slack the founder ONLY on a meaningful change (pushed a PR, closed a loop, maintainer replied): bash $2/.q-system/scripts/slack-notify.sh "<one line>". The project name is prefixed automatically -- do NOT add it yourself. Silent otherwise.
+5. Report what you did in 3-5 lines. Do not invent new work beyond the open loops.
+PROMPT_EOF
+}
+
+work_instance() {
+  local name="$1" path="$2"
+  if [ ! -d "$path" ]; then log_step "$name" skipped "path missing"; return 0; fi
+  # ONCE THE MACHINE HAS REFUSED, EVERY LATER INSTANCE IS UNATTEMPTED (ASK-869).
+  # Not failed -- nobody tried it. This is the line that turns N tickets into one
+  # and stops the sweep burning ~6s per instance on runs that cannot succeed.
+  if [ -n "$ENV_HALT" ]; then
+    log_step "$name" skipped "not attempted: $ENV_HALT"
+    return 0
+  fi
+  local script qroot
+  if [ -f "$path/q-system/q-system/.q-system/scripts/open-loops.py" ]; then
+    script="$path/q-system/q-system/.q-system/scripts/open-loops.py"; qroot="$path/q-system/q-system"
+  elif [ -f "$path/q-system/.q-system/scripts/open-loops.py" ]; then
+    script="$path/q-system/.q-system/scripts/open-loops.py"; qroot="$path/q-system"
+  else
+    log_step "$name" skipped "no open-loops.py (pre-propagation)"
+    return 0
+  fi
+  local out count
+  out="$(CLAUDE_PROJECT_DIR="$path" python3 "$script" --report 2>/dev/null || true)"
+  count="$(printf '%s\n' "$out" | grep -c '\[needs you\]' || true)"
+  if [ "${count:-0}" -eq 0 ]; then
+    echo "$(TS) heartbeat[$name]: 0 open loops -> skip" >> "$LOG"
+    log_step "$name" completed "0 open loops"
+    return 0
+  fi
+  echo "$(TS) heartbeat[$name]: $count open loop(s) -> waking headless agent" >> "$LOG"
+  local prompt; prompt="$(build_prompt "$script" "$qroot")"
+  # Byte offset BEFORE the run so the classifier below reads exactly this
+  # instance's output. Reading a fixed tail of $LOG instead would let a previous
+  # SWEEP's limit line -- the log persists across runs -- halt a healthy sweep,
+  # which is this bug pointed the other way.
+  local log_before; log_before="$(wc -c < "$LOG" 2>/dev/null || echo 0)"
+  # </dev/null: claude -p reads stdin; without this it drains the while-read loop's
+  # process-substitution feed (lines below) and truncates the sweep after the first
+  # agent-waking instance. See rca-heartbeat-tail-skip-2026-07-05.md.
+  # A PRIVATE COPY OF THIS RUN'S OUTPUT (PR #198 review round 3, major).
+  # Classifying from a byte-offset window into the SHARED log was wrong: two
+  # heartbeats overlapping -- each instance is bounded at 1800s and a wide sweep
+  # can outlive the 12h gap to the next fire -- puts one run's limit message
+  # inside the other's window, so an ordinary error gets read as a fleet-wide
+  # halt. `tee` keeps the live streaming the log is there for while giving the
+  # classifier a file only this invocation writes. pipefail is already set above,
+  # so the `if` still tests claude's status and not tee's.
+  #
+  # DELETED ON BOTH BRANCHES AND ON THE WAY OUT (PR #198 review round 4, minor).
+  # The cleanup used to live inside the FAILURE branch only, so every successful
+  # agent run left this file behind: one per agent-waking instance, twice a day,
+  # indefinitely. That is a disclosure issue and not untidiness. The file holds a
+  # verbatim copy of that instance's agent output, which is precisely why the
+  # classifier needs it, and it sits in the shared per-user temp dir until the OS
+  # reaps it. Measured against the pre-fix script with a marker string in the
+  # agent's output: a CLEAN sweep left tmp.XXXXXXXX in the system temp dir still
+  # containing the marker.
+  #
+  # AGENT_TMP is a global so the EXIT trap at the bottom of this function's
+  # section can reach it; work_instance runs sequentially, so at most one is ever
+  # live. Residual, stated rather than papered over: SIGKILL runs no trap. The
+  # trap is EXIT only, because trapping INT/TERM would make the sweep RESUME
+  # after a signal instead of dying, which is a behaviour change this finding did
+  # not ask for.
+  AGENT_TMP="$(mktemp)" || {
+    echo "$(TS) heartbeat[$name]: mktemp failed -- cannot classify this run" >> "$LOG"
+    log_step "$name" failed "mktemp failed"
+    SWEEP_FAILURES=$((SWEEP_FAILURES + 1))
+    return 0
+  }
+  local agent_tmp="$AGENT_TMP"
+  local agent_rc=0
+  # `env -u ANTHROPIC_API_KEY` at the call, not a top-of-file unset a later source
+  # could undo: subscription only, never the billed API (ASK-2176, test-subscription-only.sh).
+  ( cd "$path" && KIPI_INSTANCE_NAME="$name" env -u ANTHROPIC_API_KEY $TO claude -p "$prompt" </dev/null 2>&1 | tee -a "$LOG" > "$agent_tmp" ) || agent_rc=$?
+  # Read it out, then delete it, BEFORE either branch decides anything. The
+  # classifier below reads $agent_out and never the file, so there is exactly one
+  # place the file has to go away and no future branch can be added past it --
+  # which is how the original leak happened.
+  local agent_out; agent_out="$(cat "$agent_tmp" 2>/dev/null)"
+  _drop_agent_tmp
+  if [ "$agent_rc" -eq 0 ]; then
+    log_step "$name" completed "agent ran ($count loops)"
+  else
+    # WHOSE FAILURE IS IT (ASK-869). An exhausted account is not a property of
+    # this instance; it is a property of the MACHINE, and it is identical for
+    # every instance the sweep has not reached yet. Measured 2026-08-15: the
+    # weekly limit killed ten runs in one sweep and this branch filed ten
+    # tickets, plus a step-audit ticket for the ten "failed" steps, plus the
+    # job's own exit-1 ticket. Twelve tickets for one fact, and the sweep kept
+    # waking agents for ~6s each after the answer was already known.
+    #
+    # `.claude/rules/self-healing-retry.md` step 5 already states the rule --
+    # environmental failures stop on attempt 1 and surface immediately, because
+    # retrying cannot fix an environment. The heartbeat simply never applied it.
+    if is_environmental "$agent_out"; then
+      ENV_HALT="$(environmental_reason "$agent_out")"
+      echo "$(TS) heartbeat[$name]: environmental failure ($ENV_HALT) -- halting the sweep" >> "$LOG"
+      # skipped, NOT failed: the environment refused the run, the instance did
+      # not fail at anything. Recording it as a failure is what put a step-audit
+      # ticket on top of the pile.
+      log_step "$name" skipped "environmental: $ENV_HALT"
+      # DELIBERATELY NOT SWEEP_FAILURES (PR #198 review, major). Incrementing it
+      # exits the job non-zero, which trips the launchd-failing detector under a
+      # DIFFERENT dedupe key -- so the halt filed its own informative alert AND a
+      # generic "job failing" one. Two permanent tickets for the condition this
+      # change exists to reduce to one. Yesterday's pile proves it: the ten
+      # per-instance tickets arrived WITH a `launchd job failing:
+      # com.kipi.openloops-heartbeat (exit 1)` beside them.
+      #
+      # ASK-184's contract is preserved in PURPOSE and narrowed in WORDING. It
+      # exists so a failure cannot be SILENT: a dead agent run reaches nobody
+      # unless the exit code carries it, so fleet-health must see that. An
+      # environmental halt is not silent -- it files a named alert saying exactly
+      # what happened, one line above this. Adding a second, vaguer ticket does
+      # not make the first one louder.
+      #
+      # The per-instance failure path below still increments, so the case ASK-184
+      # was written about is untouched.
+      return 0
+    fi
+    echo "$(TS) heartbeat[$name]: agent run failed/timeout" >> "$LOG"
+    log_step "$name" failed "agent run failed/timeout"
+    SWEEP_FAILURES=$((SWEEP_FAILURES + 1))
+    KIPI_INSTANCE_NAME="$name" bash "$SKEL/q-system/.q-system/scripts/slack-notify.sh" "heartbeat: autonomous run failed/timeout -- check open-loops-heartbeat.log" 2>/dev/null || true
+  fi
+}
+
+echo "$(TS) heartbeat: fleet sweep start" >> "$LOG"
+: > "$RUNLOG_TMP"
+work_instance "kipi-system" "$SKEL"
+while IFS='|' read -r name path; do
+  [ -z "$name" ] && continue
+  [ "$path" = "$SKEL" ] && continue
+  work_instance "$name" "$path"
+done < <(python3 -c "
+import json
+try:
+    d=json.load(open('$REGISTRY'))
+    for i in d.get('instances',[]):
+        if 'status' in i and str(i['status']).startswith('merged'): continue
+        print(i['name'] + '|' + i['path'])
+except Exception: pass
+" 2>/dev/null)
+echo "$(TS) heartbeat: fleet sweep complete" >> "$LOG"
+
+# THE ONE ALERT (ASK-869). Fired here rather than at the point of detection so it
+# can state how many instances went unattempted -- the number is only known once
+# the loop has finished skipping them. One condition, one ticket, and it names
+# what a human would otherwise have to reconstruct from ten identical ones.
+if [ -n "$ENV_HALT" ]; then
+  # COUNT ONLY WHAT THE HALT SKIPPED (PR #198 review, minor). Counting every
+  # `skipped` row swept in registry drift (missing path, pre-propagation) and the
+  # instance that actually failed, so the one alert overstated itself -- reported
+  # 5 where the truth was 2. A number a human cannot reconcile against the run-log
+  # is worse than no number: it is the ticket arguing with its own evidence.
+  ENV_SKIPPED="$(grep -c 'not attempted' "$RUNLOG_TMP" 2>/dev/null || echo 0)"
+  # EXIT 0 IS EARNED BY THE ALERT LANDING, NOT ASSUMED (PR #198 review round 3,
+  # major). The halt exits 0 on the grounds that it is not SILENT -- it files a
+  # named alert instead. If that filing fails and the failure is swallowed with
+  # `|| true`, the run is silent AND reports success: no Linear alert, and no
+  # launchd signal either, which is strictly worse than the two-ticket problem
+  # this exit-0 was introduced to fix.
+  #
+  # So the claim is checked rather than trusted. Alert filed -> exit 0, one
+  # ticket. Alert failed -> fall back to the exit code, because a vague ticket
+  # beats none at all. Same reasoning as ASK-833's exit-8: a report that was not
+  # PERSISTED did not happen.
+  if bash "$SKEL/q-system/.q-system/scripts/slack-notify.sh" \
+       "heartbeat: sweep HALTED, the runner itself is unavailable ($ENV_HALT). $ENV_SKIPPED instance(s) not attempted -- this is one machine-wide condition, not one fault per instance. Nothing to fix per repo; the sweep resumes on its own when the runner is available." \
+       >>"$LOG" 2>&1; then
+    :
+  else
+    echo "$(TS) heartbeat: the halt alert FAILED to file -- falling back to a non-zero exit so the halt is not silent" >> "$LOG"
+    SWEEP_FAILURES=$((SWEEP_FAILURES + 1))
+  fi
+fi
+
+# Post-sweep self-audit: expected (registry + skeleton) vs logged. Catches the
+# case launchd-health cannot: the sweep exits 0 but never reached an instance.
+python3 -c "
+import json
+steps = [json.loads(l) for l in open('$RUNLOG_TMP') if l.strip()]
+json.dump({'job': 'open-loops-heartbeat', 'ts': '$(TS)', 'steps': steps}, open('$RUNLOG', 'w'), indent=1)
+expected = ['kipi-system']
+try:
+    d = json.load(open('$REGISTRY'))
+    for i in d.get('instances', []):
+        if 'status' in i and str(i['status']).startswith('merged'): continue
+        expected.append(i['name'])
+except Exception: pass
+json.dump(expected, open('$RUNLOG_TMP.expected', 'w'))
+" 2>> "$LOG"
+if ! AUDIT_OUT="$(python3 "$SKEL/q-system/.q-system/scripts/run-step-audit.py" \
+    --manifest "$RUNLOG_TMP.expected" --log "$RUNLOG" --job open-loops-heartbeat 2>&1)"; then
+  echo "$(TS) heartbeat AUDIT: $AUDIT_OUT" >> "$LOG"
+  bash "$SKEL/q-system/.q-system/scripts/slack-notify.sh" "heartbeat step-audit: $(printf '%s' "$AUDIT_OUT" | head -3 | tr '\n' ' ')" 2>/dev/null || true
+  SWEEP_FAILURES=$((SWEEP_FAILURES + 1))
+else
+  echo "$(TS) heartbeat AUDIT: $AUDIT_OUT" >> "$LOG"
+fi
+rm -f "$RUNLOG_TMP" "$RUNLOG_TMP.expected" 2>/dev/null || true
+
+# A `skipped` step (missing instance path, pre-propagation instance) is registry
+# drift, not a job failure, and is deliberately NOT counted here -- paging weekly
+# on known drift is the alert-fatigue that teaches the founder to ignore the
+# channel. A dead agent run, a step-audit mismatch, or an environmental halt
+# reaches Linear.
+#
+# THE ENVIRONMENTAL HALT DELIBERATELY DOES NOT REACH HERE (ASK-869). It logs its
+# instances `skipped` and does NOT increment SWEEP_FAILURES, because a non-zero
+# exit trips the launchd-failing detector under a separate dedupe key and files a
+# second, vaguer ticket beside the halt's own named one -- the two-ticket problem
+# this change exists to remove.
+#
+# ASK-184 still holds where it was aimed: it guards against a SILENT failure, and
+# a halt that filed a named alert is not silent. The one case where the halt DOES
+# increment is when that alert failed to file, which is the only way it can become
+# silent -- see the fallback above. An ordinary per-instance failure increments as
+# it always did.
+#
+# (An earlier draft of this comment described the opposite behaviour and survived
+# a round of review; it is easier to change code than the paragraph explaining it.)
+if [ "$SWEEP_FAILURES" -gt 0 ]; then
+  echo "$(TS) heartbeat: $SWEEP_FAILURES failure(s) this sweep -> exit 1" >> "$LOG"
+  exit 1
+fi
+exit 0

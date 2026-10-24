@@ -1,0 +1,775 @@
+#!/usr/bin/env python3
+"""Deterministic findings writer for the prd-os plugin.
+
+Single point where findings records are validated, ID-assigned, timestamped,
+and appended to `<findings_dir>/<prd-id>-findings.jsonl`. Claude Code
+slash commands (`/prd-review`, `/prd-triage`) delegate to this script.
+
+Why this lives in Python (not in a command prompt):
+  - Raw Codex output is free-form. The schema contract in
+    `schemas/findings.schema.json` cannot be guaranteed by asking an LLM
+    to follow it. Claude must translate Codex's output into the writer's
+    narrow input shape (`{severity, body}`). The writer re-validates on
+    every call and rejects anything that drifts.
+  - IDs must be monotonic across invocations. Only deterministic code can
+    guarantee that.
+  - Disposition changes must enforce the rationale rule (rejected/deferred
+    require explanation) and set `resolved_at` atomically with the
+    disposition field. LLM-mediated edits cannot hold that invariant.
+
+Subcommands:
+
+  add <prd-id> --source <codex-review|codex-adversarial|claude-review|
+                         claude-adversarial|manual|plan>
+      Reads a JSON array on stdin. Each item must be an object with
+      {severity, body}. Appends one validated JSONL record per item.
+      IDs increment from the current max id in the file (finding-1,
+      finding-2, ...). When source is one of REVIEWER_SOURCES the PRD
+      frontmatter is stamped with `codex_reviewed_at` plus `reviewed_by:
+      <source>` as a side effect — the approval gate requires that stamp
+      before advancing.
+
+  record-review <prd-id> --source <one of REVIEWER_SOURCES>
+      Stamp the PRD frontmatter review proof without writing any findings.
+      Use this when a reviewer pass returned zero findings; the stamp is
+      still needed for approval. `manual` and `plan` are refused here: they
+      are the author's own words, not an independent pass.
+
+  list <prd-id> [--only-pending]
+      Prints the findings file as a JSON array on stdout. Exits 2 on any
+      invalid line so triage never operates on a corrupted stream.
+
+  set-disposition <prd-id> <finding-id> <disposition> [--rationale <text>]
+      Rewrites the file with one record updated. `rejected` and `deferred`
+      require --rationale (schema rule). Sets `resolved_at` when leaving
+      `pending`; clears it when returning to `pending`.
+
+Exit codes:
+  0  success
+  2  validation error, schema violation, missing record, or file problem
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from config import Config, ConfigError, load as load_config  # noqa: E402
+
+
+SEVERITIES = ("blocker", "major", "minor", "nit")
+# ASK-1968: what KIND of problem a finding is. Optional, and a closed list
+# because issue_runner copies it onto the receipt at close, and the receipts
+# ledger is committed to a PUBLIC repo where free text is what leaks. A receipt
+# read alone abstained 81 of 100 on "what did this fix"; severity says how bad,
+# never what kind. receipts-ledger-check.py holds the same list (it cannot
+# import this file at commit time); test_receipt_finding_class.py pins the two.
+FINDING_CLASSES = (
+    "correctness",
+    "security",
+    "wiring",
+    "test-gap",
+    "data-integrity",
+    "docs",
+    "other",
+)
+SOURCES = (
+    "codex-review",
+    "codex-adversarial",
+    "claude-review",
+    "claude-adversarial",
+    "manual",
+    "plan",
+)
+# `plan` records the author's own decomposition as findings so the manifest's
+# 1:1 traceability holds WITHOUT prompting the reviewer to echo the plan back
+# (prd-os-spine-native). Plan findings NEVER stamp the review proof — the
+# approval gate still requires a real independent reviewer pass.
+#
+# REVIEWER_SOURCES (was CODEX_SOURCES, renamed 2026-07-26) is the set that
+# counts as "an independent review actually ran", which is the property the
+# approval gate cares about — not which vendor ran it. Any of these vendors may
+# be unavailable on a given day (credits, auth), and the reviewer that steps in
+# must be able to stamp itself honestly.
+# With only codex-* accepted, a non-Codex reviewer had two bad options: stamp
+# `codex-adversarial` and write a provenance record that is false, or skip the
+# stamp and never be able to approve. In a repo whose whole thesis is receipts,
+# faking the stamp is strictly worse than the blocker, so the honest sources
+# exist instead. `manual` and `plan` stay OUT: they are the author's own words,
+# not an independent pass.
+REVIEWER_SOURCES = (
+    "codex-review",
+    "codex-adversarial",
+    "claude-review",
+    "claude-adversarial",
+)
+DISPOSITIONS = ("pending", "accepted", "rejected", "deferred")
+REQUIRES_RATIONALE = ("rejected", "deferred")
+ID_RE = re.compile(r"^finding-([0-9]+)$")
+# `[^\n]*`, never `\s*.*` -- under re.M, `\s` STILL matches a newline, so a key
+# with an empty value (`reviewed_by:` with nothing after it) let `\s*` eat the
+# line break and `.*$` consume the FOLLOWING line, which sub() then replaced.
+# Found by adversarial review 2026-07-26 and driven to a real exploit: eating
+# the `findings_path:` line made _findings_gate return "no findings", so a PRD
+# with an untriaged BLOCKER advanced to `approved` with exit 0. When
+# `reviewed_by` was the last key it ate the `codex_reviewed_at` line the same
+# call had just appended, and the writer then reported `stamped: true` for a
+# stamp that was not on disk. A provenance writer emitting a false receipt is
+# the exact failure this file exists to prevent.
+REVIEWED_AT_RE = re.compile(r"(?m)^codex_reviewed_at:[^\n]*$")
+REVIEWED_BY_RE = re.compile(r"(?m)^reviewed_by:[^\n]*$")
+RECORD_FIELDS = (
+    "id",
+    "prd_id",
+    "source",
+    "severity",
+    "disposition",
+    "body",
+    "created_at",
+)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _findings_path(cfg: Config, prd_id: str) -> Path:
+    return cfg.findings_dir / f"{prd_id}-findings.jsonl"
+
+
+def _prd_spec_path(cfg: Config, prd_id: str) -> Path:
+    return cfg.prds_dir / f"{prd_id}.md"
+
+
+def _compute_stamped_spec(text: str, timestamp: str, source: str | None = None) -> str:
+    """Return new PRD spec text with the review stamp set to `timestamp`.
+
+    Pure function. Raises ValueError for malformed frontmatter so callers
+    can pre-validate before touching any other file. Keeping this stateless
+    is how `cmd_add` stays atomic: it can decide whether the stamp will
+    succeed before writing findings to disk.
+
+    The timestamp key is still `codex_reviewed_at` because prd_runner.py's
+    approval gate reads that key and every PRD already on disk carries it;
+    renaming it is a migration, not a slice-0 edit (spillover sp-b386aba4).
+    But once a non-Codex reviewer can stamp it, that key NAME is no longer
+    true on its own, and a provenance field that lies is the exact thing this
+    change exists to prevent. So `reviewed_by: <source>` is written beside it
+    and carries the truth. `source` is optional only to keep the older
+    two-argument callers working; every writer path passes it.
+    """
+    if not text.startswith("---"):
+        raise ValueError("missing YAML frontmatter")
+    end = text.find("\n---", 3)
+    if end == -1:
+        raise ValueError("frontmatter not closed with ---")
+    header = text[: end + 1]
+    rest = text[end + 1 :]
+    stamp_line = f"codex_reviewed_at: {timestamp}"
+    if REVIEWED_AT_RE.search(header):
+        header = REVIEWED_AT_RE.sub(stamp_line, header, count=1)
+    else:
+        header = header.rstrip("\n") + "\n" + stamp_line + "\n"
+    if source is not None:
+        by_line = f"reviewed_by: {source}"
+        if REVIEWED_BY_RE.search(header):
+            header = REVIEWED_BY_RE.sub(by_line, header, count=1)
+        else:
+            header = header.rstrip("\n") + "\n" + by_line + "\n"
+    return header + rest
+
+
+def _stamp_prd_reviewed(cfg: Config, prd_id: str, source: str) -> None:
+    """Record `codex_reviewed_at` on the PRD's frontmatter.
+
+    Thin wrapper for the record-review path, where atomicity is trivial
+    (only one file touched). `cmd_add` does NOT use this helper — it
+    interleaves findings and stamp writes with rollback, using
+    `_compute_stamped_spec` directly.
+    """
+    spec_path = _prd_spec_path(cfg, prd_id)
+    if not spec_path.is_file():
+        raise FileNotFoundError(f"PRD spec not found: {spec_path}")
+    try:
+        new_text = _compute_stamped_spec(spec_path.read_text(), _now_iso(), source)
+    except ValueError as exc:
+        raise ValueError(f"{spec_path}: {exc}") from exc
+    spec_path.write_text(new_text)
+
+
+# ---------------------------------------------------------------------------
+# Load / save
+# ---------------------------------------------------------------------------
+
+
+def _load_findings(path: Path) -> list[dict]:
+    """Parse existing JSONL. Missing file -> []. Invalid line -> ValueError."""
+    if not path.is_file():
+        return []
+    out: list[dict] = []
+    with path.open() as fh:
+        for lineno, raw in enumerate(fh, start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{lineno}: invalid JSON: {exc}") from exc
+            if not isinstance(rec, dict):
+                raise ValueError(f"{path}:{lineno}: record must be a JSON object")
+            out.append(rec)
+    return out
+
+
+def _write_all(path: Path, records: Iterable[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+
+def _validate_record(rec: dict, where: str) -> None:
+    for field in RECORD_FIELDS:
+        if field not in rec:
+            raise ValueError(f"{where}: missing required field {field!r}")
+    if not isinstance(rec["id"], str) or not ID_RE.match(rec["id"]):
+        raise ValueError(
+            f"{where}: id must match finding-N pattern; got {rec['id']!r}"
+        )
+    if rec["source"] not in SOURCES:
+        raise ValueError(
+            f"{where}: source must be one of {SOURCES}; got {rec['source']!r}"
+        )
+    if rec["severity"] not in SEVERITIES:
+        raise ValueError(
+            f"{where}: severity must be one of {SEVERITIES}; got {rec['severity']!r}"
+        )
+    if rec["disposition"] not in DISPOSITIONS:
+        raise ValueError(
+            f"{where}: disposition must be one of {DISPOSITIONS}; got {rec['disposition']!r}"
+        )
+    if not isinstance(rec["body"], str) or not rec["body"].strip():
+        raise ValueError(f"{where}: body must be a non-empty string")
+    if "finding_class" in rec and rec["finding_class"] not in FINDING_CLASSES:
+        raise ValueError(
+            f"{where}: finding_class must be one of {FINDING_CLASSES}; "
+            f"got {rec['finding_class']!r}"
+        )
+    if rec["disposition"] in REQUIRES_RATIONALE:
+        rationale = rec.get("rationale")
+        if not isinstance(rationale, str) or not rationale.strip():
+            raise ValueError(
+                f"{where}: disposition={rec['disposition']!r} requires a "
+                "non-empty rationale"
+            )
+
+
+def _next_id_number(existing: list[dict]) -> int:
+    max_n = 0
+    for rec in existing:
+        m = ID_RE.match(str(rec.get("id", "")))
+        if m:
+            n = int(m.group(1))
+            if n > max_n:
+                max_n = n
+    return max_n + 1
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_add(cfg: Config, args: argparse.Namespace) -> int:
+    if args.source not in SOURCES:
+        sys.stderr.write(f"--source must be one of {SOURCES}; got {args.source!r}\n")
+        return 2
+    try:
+        raw = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        sys.stderr.write(f"stdin is not valid JSON: {exc}\n")
+        return 2
+    if not isinstance(raw, list):
+        sys.stderr.write(
+            "stdin must be a JSON array of {severity, body} objects\n"
+        )
+        return 2
+    if not raw:
+        sys.stderr.write("stdin array is empty; nothing to add\n")
+        return 2
+    path = _findings_path(cfg, args.prd_id)
+    try:
+        existing = _load_findings(path)
+    except ValueError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 2
+    next_num = _next_id_number(existing)
+    new_records: list[dict] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            sys.stderr.write(f"input #{i}: must be a JSON object\n")
+            return 2
+        severity = item.get("severity")
+        body = item.get("body")
+        # Only accept the narrow input shape. Reject unknown keys so drifted
+        # Codex output that happens to parse as JSON can't sneak fields in.
+        unknown = set(item) - {"severity", "body", "finding_class"}
+        if unknown:
+            sys.stderr.write(
+                f"input #{i}: unexpected keys {sorted(unknown)}; "
+                "writer input must be {severity, body} plus an optional "
+                "finding_class\n"
+            )
+            return 2
+        if severity not in SEVERITIES:
+            sys.stderr.write(
+                f"input #{i}: severity must be one of {SEVERITIES}; got {severity!r}\n"
+            )
+            return 2
+        if not isinstance(body, str) or not body.strip():
+            sys.stderr.write(f"input #{i}: body must be a non-empty string\n")
+            return 2
+        rec = {
+            "id": f"finding-{next_num}",
+            "prd_id": args.prd_id,
+            "source": args.source,
+            "severity": severity,
+            "disposition": "pending",
+            "body": body.strip(),
+            "created_at": _now_iso(),
+        }
+        if "finding_class" in item:
+            rec["finding_class"] = item["finding_class"]
+        try:
+            _validate_record(rec, f"input #{i}")
+        except ValueError as exc:
+            sys.stderr.write(f"{exc}\n")
+            return 2
+        new_records.append(rec)
+        next_num += 1
+    # Pre-validate the stamp path BEFORE writing findings. Computing the new
+    # spec content is pure — if the spec is missing or the frontmatter is
+    # malformed we refuse before any file changes. This is what keeps the
+    # operation atomic: no scenario produces findings without the stamp.
+    new_spec_text: str | None = None
+    spec_path: Path | None = None
+    if args.source in REVIEWER_SOURCES:
+        spec_path = _prd_spec_path(cfg, args.prd_id)
+        if not spec_path.is_file():
+            sys.stderr.write(
+                f"PRD spec not found: {spec_path}. Reviewer-sourced findings "
+                "must have a PRD to stamp; refusing before any write.\n"
+            )
+            return 2
+        try:
+            new_spec_text = _compute_stamped_spec(
+                spec_path.read_text(), _now_iso(), args.source
+            )
+        except ValueError as exc:
+            sys.stderr.write(f"{spec_path}: {exc}\n")
+            return 2
+
+    # Snapshot findings pre-state so we can roll back if the stamp write
+    # fails AFTER the findings write succeeds (disk full mid-write, perms
+    # changed between read and write, etc).
+    pre_findings_bytes: bytes | None = path.read_bytes() if path.is_file() else None
+    try:
+        _write_all(path, existing + new_records)
+    except OSError as exc:
+        sys.stderr.write(f"failed to write findings: {exc}\n")
+        return 2
+
+    stamped = False
+    if new_spec_text is not None and spec_path is not None:
+        try:
+            spec_path.write_text(new_spec_text)
+            stamped = True
+        except OSError as exc:
+            # Roll the findings file back to pre-state so the caller never
+            # sees orphaned records without a stamp.
+            try:
+                if pre_findings_bytes is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(pre_findings_bytes)
+            except OSError as rollback_exc:
+                sys.stderr.write(
+                    f"stamp write failed ({exc}) and rollback ALSO failed "
+                    f"({rollback_exc}). Findings file may be in a partial "
+                    "state; inspect manually before re-running.\n"
+                )
+                return 2
+            sys.stderr.write(
+                f"stamp write failed, findings rolled back: {exc}\n"
+            )
+            return 2
+
+    print(
+        json.dumps(
+            {
+                "prd_id": args.prd_id,
+                "added": [r["id"] for r in new_records],
+                "path": str(path),
+                "codex_reviewed_stamped": stamped,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_record_review(cfg: Config, args: argparse.Namespace) -> int:
+    """Stamp the PRD frontmatter `codex_reviewed_at` without writing findings.
+
+    Used by /prd-review when Codex runs clean (no findings). Otherwise `add`
+    with a codex source stamps automatically as a side-effect. The approval
+    gate in prd_runner requires this stamp before advancing to `approved`.
+    """
+    if args.source not in REVIEWER_SOURCES:
+        sys.stderr.write(
+            f"--source must be one of {REVIEWER_SOURCES}; got {args.source!r}. "
+            "record-review documents a real independent reviewer pass only; "
+            "`manual` and `plan` are the author's own words, not a review.\n"
+        )
+        return 2
+    try:
+        _stamp_prd_reviewed(cfg, args.prd_id, args.source)
+    except (FileNotFoundError, ValueError) as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 2
+    print(
+        json.dumps(
+            {
+                "prd_id": args.prd_id,
+                "codex_reviewed_stamped": True,
+                "source": args.source,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
+    path = _findings_path(cfg, args.prd_id)
+    try:
+        recs = _load_findings(path)
+    except ValueError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 2
+    if args.only_pending:
+        recs = [r for r in recs if r.get("disposition") == "pending"]
+    print(json.dumps(recs, indent=2))
+    return 0
+
+
+def _sync_spillover_for_finding(cfg: Config, prd_id: str, finding: dict) -> None:
+    """A `deferred` finding must not be terminal. Mirror it as an OPEN spillover
+    item so the standing gate keeps it visible until it is fixed as a tracked
+    issue; moving the finding off `deferred` clears the item. Reuses
+    prd_runner's ledger helpers so there is one definition of the format.
+    Scar: `deferred` used to be a silent drop -- a rationale and then gone."""
+    from prd_runner import (_read_spillover, _spillover_append,  # sibling script
+                            _spillover_file_and_link)
+
+    sid = f"defer-{prd_id}-{finding['id']}"
+    existing = _read_spillover(cfg).get(sid)
+    if finding.get("disposition") == "deferred":
+        if existing and existing.get("status") == "open":
+            return  # idempotent: already tracked open
+        record = {
+            "id": sid, "source": prd_id, "finding_id": finding["id"],
+            "description": f"deferred finding {finding['id']}: {str(finding.get('body', ''))[:120]}",
+            "severity": finding.get("severity", "minor"),
+            "status": "open", "created_at": _now_iso(),
+        }
+        _spillover_append(cfg, record)
+        # ASK-1552: the row first, then its Linear issue. A filer failure is
+        # recorded on the row for spillover-linear-check.py to retry.
+        _spillover_file_and_link(cfg, record)
+    elif existing and existing.get("status") == "open":
+        new = dict(existing)
+        new.update(status="resolved",
+                   void_reason=f"finding re-dispositioned to {finding.get('disposition')}",
+                   resolved_at=_now_iso())
+        _spillover_append(cfg, new)
+
+
+def _rollback_findings(path: Path, pre_bytes: bytes | None) -> bool:
+    """Restore the findings file to its pre-write bytes. Returns success."""
+    try:
+        if pre_bytes is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(pre_bytes)
+        return True
+    except OSError:
+        return False
+
+
+def cmd_set_disposition(cfg: Config, args: argparse.Namespace) -> int:  # noqa: C901
+    if args.disposition not in DISPOSITIONS:
+        sys.stderr.write(
+            f"disposition must be one of {DISPOSITIONS}; got {args.disposition!r}\n"
+        )
+        return 2
+    if args.disposition in REQUIRES_RATIONALE and not (args.rationale or "").strip():
+        sys.stderr.write(
+            f"disposition={args.disposition!r} requires --rationale\n"
+        )
+        return 2
+    # Judgment Compiler fail-fast half (PRD prd-judgment-compiler-2026-08-04):
+    # an evidence-requiring reason code without its stable reference is refused
+    # BEFORE the findings file mutates, so a gate failure never leaves the
+    # ledger and the findings file disagreeing about what happened.
+    judgment_enabled = os.environ.get("KIPI_JUDGMENT_CAPTURE") != "0"
+    if judgment_enabled:
+        import judgment_compiler
+
+        gate_errors = judgment_compiler.validate_triage_decision(
+            getattr(args, "reason_code", None), getattr(args, "evidence", []),
+            args.disposition, cfg)
+        if gate_errors:
+            for gate_error in gate_errors:
+                sys.stderr.write(f"{gate_error}\n")
+            return 2
+    path = _findings_path(cfg, args.prd_id)
+    # ONE critical section over the READ, the mutation AND the write (Codex
+    # major, PR #103 round 5). The lock used to start after `_load_findings`,
+    # so two concurrent dispositions each loaded the same snapshot, each
+    # mutated its own finding in its own copy, and each wrote the WHOLE list
+    # back: the second silently reverted the first while both receipts
+    # recorded success. Serialising stale snapshots is not serialising the
+    # transaction. The round-5 reproducer returned final_dispositions
+    # {'finding-1': 'accepted', 'finding-2': 'pending'} with two accepted
+    # receipts -- lost disposition state, invisible to both writers.
+    #
+    # Taken UNCONDITIONALLY. The previous judgment-disabled branch used a
+    # nullcontext, reasoning that with no receipt coming there is no window to
+    # close. That reasoning was about the write-to-receipt observation gap
+    # (sp-0c725cde) and does NOT extend to lost updates, which happen with or
+    # without a receipt. `ledger_lock` is re-entrant per thread, so the
+    # capture below can take it again.
+    import judgment_compiler
+
+    with judgment_compiler.ledger_lock(cfg):
+        try:
+            recs = _load_findings(path)
+        except ValueError as exc:
+            sys.stderr.write(f"{exc}\n")
+            return 2
+        target = None
+        for rec in recs:
+            if rec.get("id") == args.finding_id:
+                target = rec
+                break
+        if target is None:
+            sys.stderr.write(f"finding not found: {args.finding_id}\n")
+            return 2
+        # Founder 2026-09-12: "New minor findings: fix or reject, never queue."
+        # Refused BEFORE the findings file changes; a missing severity is the
+        # `minor` default the spillover mirror would have stamped.
+        from prd_runner import MINOR_REFUSAL, SPILLOVER_REFUSED_SEVERITIES
+        if (args.disposition == "deferred"
+                and str(target.get("severity") or "minor").strip().lower()
+                in SPILLOVER_REFUSED_SEVERITIES):
+            sys.stderr.write(f"refused: {MINOR_REFUSAL}. Accept and fix it, or "
+                             "reject it with --rationale.\n")
+            return 2
+        target["disposition"] = args.disposition
+        if getattr(args, "covered_by", "") and args.covered_by.strip():
+            # umbrella coverage: this finding is owned by a phase PRD
+            target["covered_by"] = args.covered_by.strip()
+        if args.rationale and args.rationale.strip():
+            target["rationale"] = args.rationale.strip()
+        elif args.disposition == "pending":
+            target.pop("rationale", None)
+        if args.disposition == "pending":
+            target.pop("resolved_at", None)
+        else:
+            target["resolved_at"] = _now_iso()
+        try:
+            _validate_record(target, f"{path}:{args.finding_id}")
+        except ValueError as exc:
+            sys.stderr.write(f"{exc}\n")
+            return 2
+        # Snapshot BEFORE the write so a failed capture can restore it. Mirrors the
+        # rollback cmd_add already does for its stamp step. Without this, any
+        # capture failure that the fail-fast pre-check cannot see (a stale packet, a
+        # bad --judge-run, an unresolvable evidence ref, an OSError on the shared
+        # ledger) left the findings file saying "rejected" with no receipt — the
+        # exact divergence `verify --cross-check` exists to detect, manufactured by
+        # our own primary write path (review 2026-08-04).
+        pre_findings_bytes = path.read_bytes() if path.is_file() else None
+        # Assemble BEFORE the write, inside the lock. The receipt must freeze
+        # decision-time context, and the judge assembled its packet while this
+        # finding was still pending. Assembling after the write dropped every
+        # cross-PRD duplicate candidate (they are computed for pending findings
+        # only) and moved the packet hash, so any finding with one could not be
+        # captured with a judge run at all (Codex major, PR #103 round 4).
+        decision_packet = None
+        if judgment_enabled:
+            try:
+                decision_packet = judgment_compiler.assemble_packet(
+                    cfg, args.prd_id, args.finding_id)
+            except (judgment_compiler.ValidationError, OSError) as exc:
+                sys.stderr.write(
+                    f"judgment context could not be assembled: {exc}\n"
+                    "findings file unchanged.\n")
+                return 2
+        _write_all(path, recs)
+        # INSIDE the lock, with the write above: that pairing is the whole
+        # point of the critical section. The receipt still lands before
+        # spillover fans out, which stays OUTSIDE the lock below.
+        if judgment_enabled:
+            try:
+                judgment_compiler.capture_from_triage(
+                    cfg, args.prd_id, target,
+                    actor=getattr(args, "actor", "founder"),
+                    reason_code=getattr(args, "reason_code", None),
+                    evidence_refs=list(getattr(args, "evidence", [])),
+                    # Freeze what the RECORD says, not what the flag said. A
+                    # re-disposition to accepted passes no --rationale while the
+                    # record keeps its previous one (only `pending` clears it), so
+                    # reading the flag captured None against a record that still had
+                    # text -- and the decision fingerprint then falsely reported the
+                    # decision as uncaptured (Codex, PR #101 round 6: a regression
+                    # from the round-5 fingerprint fix).
+                    rationale=(target.get("rationale") or "").strip() or None,
+                    judge_run_path=getattr(args, "judge_run", None),
+                    packet=decision_packet,
+                )
+            except (judgment_compiler.ValidationError, OSError) as exc:
+                rolled_back = _rollback_findings(path, pre_findings_bytes)
+                sys.stderr.write(
+                    f"judgment receipt refused: {exc}\n"
+                    + ("disposition rolled back; findings file unchanged.\n"
+                       if rolled_back else
+                       "WARNING: rollback ALSO failed. The findings file may now "
+                       "disagree with the judgment ledger; run "
+                       "`kipi judgment verify --cross-check` before trusting it.\n")
+                )
+                return 2
+    # Spillover fans out AFTER the receipt lands, not before. Ordered the other
+    # way, a refused receipt rolled the findings file back while the spillover
+    # append stood — and that ledger is append-only, so the standing gate saw
+    # permanent open work for a disposition the command had just reported as
+    # rolled back (Codex review, PR #97, executed reproducer). The receipt is
+    # the failure-prone step, so it goes first among the two irreversible ones.
+    _sync_spillover_for_finding(cfg, args.prd_id, target)
+    print(
+        json.dumps(
+            {
+                "prd_id": args.prd_id,
+                "updated": args.finding_id,
+                "disposition": args.disposition,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Entry
+# ---------------------------------------------------------------------------
+
+
+def cmd_advisory(cfg: Config, args: argparse.Namespace) -> int:
+    """Print the cross-PRD xref advisory for a PRD's pending findings.
+
+    Non-blocking guarantee: ANY failure of the xref (raised exception, import
+    error, missing/malformed sibling file) is caught here, logged as a one-line
+    warning to stderr, and swallowed. The advisory can never change this
+    command's exit code or block `/prd-triage`. Advisory means advisory.
+    """
+    try:
+        import findings_xref
+
+        repo_root = Path(args.repo_root).resolve() if args.repo_root else None
+        matches = findings_xref.cross_reference(
+            args.prd_id,
+            cfg=cfg,
+            repo_root=repo_root,
+            threshold=getattr(args, "threshold", None),
+        )
+        block = findings_xref.format_advisory(matches)
+        if block:
+            print(block)
+    except Exception as exc:  # noqa: BLE001 - advisory must never block triage
+        sys.stderr.write(f"xref unavailable: {exc}\n")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo-root", help="override repo root discovery")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_adv = sub.add_parser("advisory")
+    p_adv.add_argument("prd_id")
+    p_adv.add_argument("--threshold", type=float, default=None)
+    p_adv.set_defaults(func=cmd_advisory)
+
+    p_add = sub.add_parser("add")
+    p_add.add_argument("prd_id")
+    p_add.add_argument("--source", required=True)
+    p_add.set_defaults(func=cmd_add)
+
+    p_list = sub.add_parser("list")
+    p_list.add_argument("prd_id")
+    p_list.add_argument("--only-pending", action="store_true")
+    p_list.set_defaults(func=cmd_list)
+
+    p_set = sub.add_parser("set-disposition")
+    p_set.add_argument("prd_id")
+    p_set.add_argument("finding_id")
+    p_set.add_argument("disposition")
+    p_set.add_argument("--rationale", default="")
+    p_set.add_argument("--covered-by", default="", dest="covered_by",
+                       help="umbrella coverage: the phase PRD id that owns this finding")
+    p_set.add_argument("--reason-code", default=None, dest="reason_code",
+                       help="canonical judgment reason code (judgment_compiler)")
+    p_set.add_argument("--evidence", action="append", default=[],
+                       help="stable evidence ref (repeatable), e.g. finding:<prd>/<id>")
+    p_set.add_argument("--actor", default="founder",
+                       help="who made this decision (judgment receipt)")
+    p_set.add_argument("--judge-run", default=None, dest="judge_run",
+                       help="path to a judge-run JSON bound to the context packet")
+    p_set.set_defaults(func=cmd_set_disposition)
+
+    p_rec = sub.add_parser("record-review")
+    p_rec.add_argument("prd_id")
+    p_rec.add_argument("--source", required=True)
+    p_rec.set_defaults(func=cmd_record_review)
+
+    args = parser.parse_args(argv)
+    try:
+        repo_root = Path(args.repo_root).resolve() if args.repo_root else None
+        cfg = load_config(repo_root, strict=True)
+    except ConfigError as exc:
+        # The advisory command is non-blocking by contract: a config error must
+        # never block /prd-triage. Every other command genuinely needs config.
+        if getattr(args, "func", None) is cmd_advisory:
+            sys.stderr.write(f"xref unavailable: {exc}\n")
+            return 0
+        sys.stderr.write(f"prd-os config error: {exc}\n")
+        return 2
+    return args.func(cfg, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

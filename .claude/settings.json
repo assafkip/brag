@@ -1,0 +1,590 @@
+{
+  "extraKnownMarketplaces": {
+    "kipi": {
+      "source": {
+        "source": "github",
+        "repo": "assafkip/kipi-system"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "kipi-core@kipi": true
+  },
+  "outputStyle": "AUDHD",
+  "effortLevel": "thorough",
+  "autoMemoryEnabled": true,
+  "cleanupPeriodDays": 30,
+  "model": "opus",
+  "worktree": {
+    "symlinkDirectories": [
+      "node_modules",
+      ".cache",
+      "q-system/output"
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "bash \"$CLAUDE_PROJECT_DIR/q-system/hooks/statusline.sh\" 2>/dev/null || true"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(node:*)",
+      "Bash(npm:*)",
+      "Bash(npx:*)",
+      "Bash(python3:*)",
+      "Bash(git log:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git branch:*)",
+      "Bash(git checkout:*)",
+      "Bash(git switch:*)",
+      "Bash(git fetch:*)",
+      "Bash(git pull:*)",
+      "Bash(git push:*)",
+      "Bash(git stash:*)",
+      "Bash(git merge:*)",
+      "Bash(gh:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(wc:*)",
+      "Bash(tree:*)",
+      "Bash(echo:*)",
+      "Bash(mkdir:*)"
+    ],
+    "deny": [
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf .*)",
+      "Bash(sudo*)",
+      "Bash(git push --force*)",
+      "Bash(git reset --hard*)",
+      "Bash(git rebase*)",
+      "Bash(chmod 777*)",
+      "Bash(curl * | bash*)",
+      "Bash(wget * | bash*)",
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Read(**/credentials*)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)",
+      "Edit(.env)",
+      "Edit(.env.*)",
+      "Edit(**/.env)",
+      "Edit(**/.env.*)",
+      "Edit(**/credentials*)"
+    ],
+    "defaultMode": "acceptEdits"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/q-system/hooks/git-health-check.sh\" 2>/dev/null || true",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/q-system/hooks/session-start.py\" 2>/dev/null || true",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/md-prune.py\" 2>/dev/null || true",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/memory-freshness-check.py\" 2>/dev/null || true",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/q-system/hooks/lessons-index.py\" 2>/dev/null || true",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/q-system/hooks/auto-update.sh\" 2>/dev/null || true"
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/open-loops.py\" 2>/dev/null || true"
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/fleet-board-refresh.py\" 2>/dev/null || true"
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/memory-confidence-surface.py\" 2>/dev/null || true"
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/memory-scores-surface.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/memory-scores-surface.py\" 2>/dev/null || true"
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/sycophancy-monthly-check.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/sycophancy-monthly-check.py\" 2>/dev/null || true",
+            "timeout": 35
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/miyo-session-pull.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/miyo-session-pull.py\" 2>/dev/null || true",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/voice-stop-gate.py\"; then python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/voice-stop-gate.py\" --drain-only; fi"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/token-guard.py\" ]; then python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/token-guard.py\"; fi",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/voice-dna-loader.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/voice-dna-loader.py\" || true",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/lessons-inject.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/lessons-inject.py\" || true",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/knowledge-inject.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/knowledge-inject.py\" || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/token-guard.py\" ]; then python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/token-guard.py\"; fi",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/read-first-gate.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/read-first-gate.py\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/claude-path-write-guard.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/claude-path-write-guard.py\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/merge-bypass-gate.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/merge-bypass-gate.py\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/worktree-disk-floor.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/worktree-disk-floor.py\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "EnterWorktree",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/worktree-disk-floor.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/worktree-disk-floor.py\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Grep|Glob|WebSearch|WebFetch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/miyo-research-gate.py\"; then python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/miyo-research-gate.py\"; fi",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|SendUserFile|Artifact|mcp__playwright__.*|mcp__claude-in-chrome__.*|mcp__plugin_chrome-devtools.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/design-chain-gate.py\" && python3 -I \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/design-chain-gate.py\""
+          }
+        ]
+      },
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/design-engine-door.py\" && python3 -I \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/design-engine-door.py\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/token-guard.py\" ]; then python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/token-guard.py\"; fi",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "for R in q-system/.q-system/scripts/claude-path-write-guard.py q-system/.q-system/scripts/claude-integrity-tripwire.py; do [ -f \"$CLAUDE_PROJECT_DIR/$R\" ] && continue; git -C \"$CLAUDE_PROJECT_DIR\" checkout -- \"$R\" >/dev/null 2>&1; N=\"${KIPI_NOTIFY:-$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/slack-notify.sh}\"; if [ -f \"$CLAUDE_PROJECT_DIR/$R\" ]; then \"$N\" \"SECURITY: $R was deleted; restored from git\" >/dev/null 2>&1; else \"$N\" \"SECURITY: $R was deleted and git could not restore it -- that layer is DOWN\" >/dev/null 2>&1; echo \"SECURITY: $R is missing and could not be restored\" >&2; exit 2; fi; done",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/claude-integrity-tripwire.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/claude-integrity-tripwire.py\" --enforce --quiet",
+            "timeout": 20
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/design-chain-gate.py\" && python3 -I \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/design-chain-gate.py\""
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/prompt-only-enforcement-guard.py\"; then python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/prompt-only-enforcement-guard.py\"; fi",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "if test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/enforced-claim-lint.py\"; then python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/enforced-claim-lint.py\"; fi",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/voice-lint.py\" ]; then python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/voice-lint.py\"; fi",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/voice-substance-lint.py\" ]; then python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/voice-substance-lint.py\"; fi",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/voiceloop-band-lint.py\" ]; then python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/voiceloop-band-lint.py\"; fi",
+            "timeout": 35
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/memory-confidence-validator.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/memory-confidence-validator.py\""
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/consumer-parity-check.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/consumer-parity-check.py\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/audhd-lint.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/audhd-lint.py\""
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/batch-uniformity-lint.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/batch-uniformity-lint.py\""
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/decision-origin-tag-lint.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/decision-origin-tag-lint.py\""
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/format-lint.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/format-lint.py\""
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/linear-filer-label-lint.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/linear-filer-label-lint.py\""
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/headline-lint.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/headline-lint.py\""
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/spillover-ratchet.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/spillover-ratchet.py\""
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/lessons-validator.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/lessons-validator.py\""
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/linkedin-format-lint.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/linkedin-format-lint.py\""
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/wiring-check.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/wiring-check.py\""
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/plan-lint.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/plan-lint.py\""
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/instrument-lint.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/instrument-lint.py\""
+          },
+          {
+            "type": "command",
+            "command": "if test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/instance-automation-guard.py\"; then python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/instance-automation-guard.py\"; fi",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/client-output-evidence-gate.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/client-output-evidence-gate.py\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/capability-claim-lint.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/capability-claim-lint.py\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/evidence-read-log-lint.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/evidence-read-log-lint.py\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/handoff-provenance-lint.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/handoff-provenance-lint.py\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/hook_envelope_audit.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/hook_envelope_audit.py\" --hook",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/hook-path-resolve-check.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/hook-path-resolve-check.py\" --hook",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/portability-lint-hook.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/portability-lint-hook.py\""
+          }
+        ]
+      },
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/design-engine-door.py\" && python3 -I \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/design-engine-door.py\""
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/q-system/hooks/post-compact.sh\" 2>/dev/null || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/code_claim_grounding_guard.py\"; then python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/code_claim_grounding_guard.py\"; fi",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "if test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/blocked-claim-evidence-lint.py\"; then python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/blocked-claim-evidence-lint.py\"; fi",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "if test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/voice-stop-gate.py\"; then python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/voice-stop-gate.py\"; fi",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/q-system/hooks/auto-commit.py\" --detach 2>/dev/null || true",
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/q-system/hooks/stop-logger.sh\" 2>/dev/null || true",
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/memory_autocapture.py\" && python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/memory_autocapture.py\" 2>/dev/null || true",
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "if test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/kb-graph-guard.py\"; then python3 \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/kb-graph-guard.py\"; fi",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "if test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/design-chain-gate.py\"; then python3 -I \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/design-chain-gate.py\"; fi"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if test -f \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/design-chain-gate.py\"; then python3 -I \"$CLAUDE_PROJECT_DIR/q-system/.q-system/scripts/design-chain-gate.py\"; fi"
+          }
+        ]
+      }
+    ]
+  },
+  "mcpServers": {
+    "_INSTRUCTIONS_": "Uncomment and configure the servers you need. Replace YOUR_*_TOKEN placeholders with your actual tokens. Delete this _INSTRUCTIONS_ key when done.",
+    "_notion_api": {
+      "_comment": "Rename to 'notion_api' to enable. Get token from https://www.notion.so/my-integrations",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@notionhq/notion-mcp-server"
+      ],
+      "env": {
+        "NOTION_TOKEN": "YOUR_NOTION_TOKEN"
+      }
+    },
+    "_apify": {
+      "_comment": "Rename to 'apify' to enable. Get token from https://console.apify.com/account#/integrations",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@apify/actors-mcp-server@0.9.10"
+      ],
+      "env": {
+        "APIFY_TOKEN": "YOUR_APIFY_TOKEN",
+        "TOOLS": "actors,curious_coder/twitter-scraper,apify/web-scraper,apify/instagram-hashtag-scraper,apify/instagram-profile-scraper,apify/instagram-post-scraper,clockworks/tiktok-scraper,clockworks/tiktok-profile-scraper"
+      }
+    },
+    "_nano-banana": {
+      "_comment": "Rename to 'nano-banana' to enable. Image generation via Gemini. Install: npm i -g nano-banana-mcp",
+      "command": "nano-banana-mcp",
+      "env": {
+        "GEMINI_API_KEY": "YOUR_GEMINI_API_KEY"
+      }
+    },
+    "_notebooklm": {
+      "_comment": "Rename to 'notebooklm' to enable. Browser-based Google auth on first run.",
+      "command": "npx",
+      "args": [
+        "-y",
+        "notebooklm-mcp@latest"
+      ]
+    },
+    "_telegram": {
+      "_comment": "Rename to 'telegram' to enable. Get credentials from https://my.telegram.org",
+      "command": "telegram-mcp",
+      "env": {
+        "TG_APP_ID": "YOUR_TELEGRAM_APP_ID",
+        "TG_API_HASH": "YOUR_TELEGRAM_API_HASH"
+      }
+    },
+    "_obsidian": {
+      "_comment": "Rename to 'obsidian' to enable. Requires Obsidian Local REST API plugin. Get key from plugin settings.",
+      "command": "uvx",
+      "args": [
+        "mcp-obsidian"
+      ],
+      "env": {
+        "OBSIDIAN_API_KEY": "YOUR_OBSIDIAN_API_KEY"
+      }
+    },
+    "_playwright": {
+      "_comment": "Rename to 'playwright' to enable. Browser automation alternative to Chrome MCP.",
+      "command": "npx",
+      "args": [
+        "@playwright/mcp@latest"
+      ]
+    }
+  },
+  "toolConfigurations": {
+    "Read": {
+      "autoApprove": [
+        "**/*"
+      ],
+      "deny": [
+        ".env",
+        "**/.env"
+      ]
+    },
+    "Edit": {
+      "autoApprove": [
+        "**/*"
+      ]
+    },
+    "Write": {
+      "autoApprove": [
+        "**/*"
+      ]
+    },
+    "mcp__claude_ai_Notion__*": {
+      "autoApprove": [
+        "*"
+      ]
+    },
+    "mcp__apify__*": {
+      "autoApprove": [
+        "*"
+      ]
+    }
+  },
+  "_recommended_plugins": "Enable these in Claude Code plugin manager: document-skills@anthropic-agent-skills, Notion@claude-plugins-official (if using Notion CRM), github@claude-plugins-official"
+}

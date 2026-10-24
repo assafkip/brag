@@ -1,0 +1,1198 @@
+#!/usr/bin/env bash
+# Shared verdict semantics for the PR review loop (ASK-113, severity floor).
+#
+# WHY A LIB: the reviewer (pr-review-agent.sh) and the worker (linear-worker.sh)
+# both need to know what a review concluded. Two scripts each grepping the review
+# prose with their own regex is two readers of one input with different
+# semantics -- the exact defect class review round 2 flagged on this PR line.
+# One extractor, one gate, sourced by both.
+#
+# The DATA hand-off between them is the verdict record
+# (~/.config/kipi/pr-reviews/pr-<N>.verdict.json), written once by the reviewer.
+# The worker only falls back to re-extracting from the review .md for PRs
+# reviewed before the record existed.
+
+# review_round below counts review-prose files, and the name of those files is
+# owned by repo-slug-lib.sh -- the same file the WRITER builds its path from.
+# Importing it here rather than trusting the caller to have sourced it first is
+# what makes the two sides one convention instead of two that happen to agree:
+# a caller that sourced only this lib would otherwise fall back to a stale glob.
+# Guarded so a caller that already sourced it is not re-sourced.
+if ! declare -F artifact_key >/dev/null 2>&1; then
+  # shellcheck source=repo-slug-lib.sh
+  . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/repo-slug-lib.sh"
+fi
+
+# extract_verdict <review-file>
+# Prints APPROVE | APPROVE WITH NITS | REQUEST CHANGES | BLOCK, or nothing if
+# the file states no verdict (empty file, killed run, freeform prose).
+# Anchored on the VERDICT line first so prose like "this would BLOCK deploys"
+# elsewhere in the review cannot win; whole-file grep is only the fallback.
+# The sed strips BLOCKER/BLOCKERS before token matching: the REAL round-2
+# review of PR #11 ends "Fix first: **BLOCKER 1**" after its verdict line, and
+# a bare BLOCK token match reads that as verdict BLOCK. Found by using the
+# captured payload as the fixture, which is the point of the fixture rule.
+#
+# TWO further real-payload corrections, both from PR #11 round 4 (2026-07-27):
+#   - the verdict may sit on the line AFTER a bare `## VERDICT` heading, so the
+#     anchor has to span a few lines (-A3), not just the matching line.
+#   - the verdict line can QUALIFY itself: `**REQUEST CHANGES** (not BLOCK --
+#     nothing here writes an unrecoverable object)`. Taking the last token on
+#     that line records BLOCK for a review that said the opposite in the same
+#     breath. The verdict is stated FIRST and qualified after, so take head -1.
+# That misread actually reached the record: pr-11.verdict.json read BLOCK while
+# the review said REQUEST CHANGES. Both route to rework so behavior survived,
+# but "APPROVE (not BLOCK...)" would have reworked an approved PR forever.
+# A VERDICT STATEMENT, NOT A LINE MENTIONING THE WORD (ASK-356). This used to
+# anchor on the first line matching `VERDICT`, take the first verdict token within
+# three lines, and fall back to grepping the WHOLE FILE for a token. All three
+# steps read the reviewer's conclusion out of text the reviewer did not write.
+#
+# `codex exec` ECHOES THE ENTIRE PROMPT to stdout, and the reviewer prompt carries
+# its own grading rule:
+#
+#     - **VERDICT:** decided by THIS RULE, not by feel:
+#         - any blocker or major finding      => REQUEST CHANGES
+#
+# That line is the first `VERDICT` match in every codex review ever produced, so
+# extract_verdict returned REQUEST CHANGES universally. Measured 2026-08-03: 47 of
+# 54 records carried stated=REQUEST CHANGES. It was cosmetic while
+# VERDICT="$DERIVED_VERDICT" won unconditionally, and became fleet-blocking the
+# moment ASK-312 made resolve_verdict take the HARSHER of stated and derived --
+# every codex-reviewed PR held at REQUEST CHANGES on a REQUIRED context. Codex
+# called this exact consequence on PR #89 and we shipped anyway; the answer was
+# always "keep resolve_verdict AND fix this", not one or the other.
+#
+# SHAPE FIRST, AND DELIBERATELY NOT "TAKE THE LAST MATCH" (review steer, ASK-356).
+# Copying findings_block's LAST-NOT-FIRST wholesale would be a second position
+# rule, and anchoring on position is what produced this bug. The grading rule is
+# not distinguished by WHERE it sits. It is distinguished by not being a
+# statement: a statement puts the verdict token DIRECTLY after the marker, while
+# the rule puts prose there. So the token must lead what follows `VERDICT:`, or
+# follow a marker that is bare (`## VERDICT` on its own line -- the real PR #11
+# round 4 shape, which also self-qualifies as `**REQUEST CHANGES** (not BLOCK...)`
+# and must still read REQUEST CHANGES).
+#
+# ORDER IS STILL NEEDED, FOR A DIFFERENT INPUT. The stream also replays the PR's
+# DIFF, so a review of a change to this loop contains real verdict statements the
+# reviewer is only quoting -- this file's own fixtures are exactly that. Those are
+# statement-shaped because they ARE quoted statements; shape cannot separate them.
+# The reviewer answers after the material it was given, so among candidates that
+# PASS the shape test the last one wins. Shape rejects the prompt; order resolves
+# the quotes. Neither alone is enough and the two are not the same rule.
+#
+# THE WHOLE-FILE FALLBACK IS GONE. With the echo present it scanned the prompt and
+# the diff for loose tokens, which is how source code gets parsed as a verdict
+# (`REWORK_VERDICTS = {"REQUEST CHANGES", ...}` is in the diff of this very
+# change). Losing it means a review that never states a verdict now reads
+# unstated, and unstated posts state=failure and HOLDS the PR. That is the safe
+# direction and the same posture the rest of this file takes.
+#
+# BLOCKER/BLOCKERS is still stripped before token matching: "Fix first: **BLOCKER
+# 1**" after a verdict line made a bare BLOCK match report verdict BLOCK on the
+# real PR #11 round 2 payload.
+extract_verdict() {
+  local f="$1"
+  [ -s "$f" ] || return 0
+  awk '
+    function leading_token(s,   t) {
+      sub(/^[[:space:]*_]+/, "", s)
+      if (s ~ /^APPROVE WITH NITS/) return "APPROVE WITH NITS"
+      if (s ~ /^REQUEST CHANGES/)   return "REQUEST CHANGES"
+      if (s ~ /^APPROVE/)           return "APPROVE"
+      if (s ~ /^BLOCK/)             return "BLOCK"
+      return ""
+    }
+    {
+      line = $0
+      gsub(/BLOCKERS?/, "", line)
+    }
+    # Under a bare heading the FIRST non-blank line decides, and it decides either
+    # way: prose there is not a verdict, it is a heading with no statement under
+    # it. Continuing to scan would walk into the next paragraph.
+    awaiting {
+      if (line ~ /^[[:space:]]*$/) next
+      awaiting = 0
+      t = leading_token(line)
+      if (t != "") found = t
+      next
+    }
+    line ~ /VERDICT/ {
+      rest = line
+      sub(/^.*VERDICT[*_]*[[:space:]]*:?[[:space:]]*/, "", rest)
+      t = leading_token(rest)
+      if (t != "") { found = t; next }
+      # Bare marker: nothing but punctuation/emphasis left on the line.
+      if (rest ~ /^[[:space:]*_:#-]*$/) awaiting = 1
+    }
+    END { if (found != "") printf "%s", found }
+  ' "$f" 2>/dev/null
+}
+
+# findings_block <review-file>
+# THE ONE READER of the machine-readable findings block. Prints the LAST COMPLETE
+# block, or nothing. Every consumer of findings -- the verdict derivation, the
+# minor capture, the reviewer's Linear comment -- goes through here.
+#
+# WHY IT EXISTS (sp-c0a9dac3). Three call sites each ran their own
+# `sed -n '/^FINDINGS:/,/^END FINDINGS/p'`, which is wrong in two ways at once,
+# and the fix had landed in only one of the three languages involved:
+#
+#   MULTIPLE BLOCKS CONCATENATE. sed RESTARTS the range after every `END
+#   FINDINGS`, so a review containing two blocks yields both, glued together, and
+#   a severity from a block that is not the verdict block sets the gate. Not
+#   hypothetical: codex stdout is known to carry harness noise and A REPEATED
+#   FINAL LINE (recorded on ASK-221 -- `hook: Stop`, `tokens used`, the last line
+#   again), the reviewer prompt itself contains a literal `FINDINGS:` /
+#   `END FINDINGS` template the model can echo, and from round 2 the prompt hands
+#   the model the PREVIOUS round's findings to re-prove.
+#
+#   AN UNCLOSED BLOCK RUNS TO EOF. A stream that died one line into the block
+#   printed a range with no severity lines, and no severities derives APPROVE --
+#   a green gate for a review nobody read. pr-review-agent.sh defends that with
+#   its own REVIEW_UNUSABLE flag, but the LIB still handed APPROVE to anyone else
+#   who asked, so the safety lived in one caller instead of in the reader.
+#
+# LAST, NOT FIRST. The prompt says "Last, a machine-readable findings block", and
+# a duplicated final line makes the last one the complete one. Taking the first
+# would pick the echoed template.
+#
+# A BLOCK STILL OPEN AT EOF VOIDS THE WHOLE REVIEW, earlier complete blocks
+# included. This is the case the first cut of this function got wrong, caught by
+# its own reproducer: "last COMPLETE block" quietly falls back to a QUOTED
+# prior-round block when the real trailing block is cut off mid-write, so a
+# truncated review would derive a verdict from findings it had already withdrawn --
+# and the completeness predicate built on it would call that review usable. An open
+# block at EOF is evidence of truncation, so nothing in the stream is trustworthy.
+#
+# The cost of that strictness is a review whose PROSE happens to end with a line
+# starting `FINDINGS:` reads as unstated. That is the safe direction and the same
+# posture the rest of this file takes: unstated HOLDS a PR, green RELEASES it.
+#
+# awk, not sed, because the rule is stateful in two ways a range expression cannot
+# express: opening a new block discards an unclosed one, and the end-of-input state
+# decides whether any of it counts.
+# A BLOCK OF NOTHING BUT PLACEHOLDERS IS THE PROMPT, NOT THE REVIEW (sp-df1a458f).
+# The reviewer prompt ends with a literal template -- `severity|one-sentence
+# claim|file:line` between the two markers -- and `codex exec` echoes the whole
+# prompt to stdout. When the model answers with a PLAN instead of a review, that
+# echo is the ONLY complete block in the stream. Measured 2026-08-03 on client_d PR
+# #1 round 2: the block was accepted, `severity|` matched no severity, no
+# severities derived APPROVE, and kipi/reviewer-approved -- a REQUIRED context on
+# main -- went green on code nobody had read, 12 seconds after dispatch.
+#
+# The rule is NOT "reject a block with no severity rows": an EMPTY block is
+# legitimate and load-bearing (a round 2 that refutes everything closes with one;
+# test-severity-floor.sh and test-findings-block-reader.sh case 2 both pin it).
+# The discriminator is rows-that-are-not-findings:
+#
+#   zero rows                      -> legitimate empty block, kept
+#   >=1 row, >=1 a real severity   -> a real block, kept
+#   >=1 row, NONE a real severity  -> the template echo (or prose leaked into the
+#                                     block); not a findings block, skipped
+#
+# Skipped, not fatal: an earlier COMPLETE real block still stands, because the
+# echo arrives BEFORE the model's own answer. Truncation is unchanged -- a block
+# still open at EOF voids everything, which is the stricter case and stays.
+#
+# THE SEVERITY TOKENS HERE ARE THE SAME FOUR verdict_from_findings GRADES, and
+# they have to be: a row this function calls real but the derivation cannot grade
+# contributes nothing, so the block would count as usable and derive APPROVE --
+# the defect again, one layer down. Change the two together or not at all.
+findings_block() {
+  local f="$1"
+  [ -s "$f" ] || return 0
+  awk '
+    /^FINDINGS:/            { buf = $0 "\n"; open = 1; rows = 0; sev = 0; next }
+    open && /^END FINDINGS/ { if (rows == 0 || sev > 0) last = buf $0 "\n"
+                              open = 0; next }
+    open                    { buf = buf $0 "\n"
+                              if ($0 ~ /^[ \t]*$/) next
+                              rows++
+                              if ($0 ~ /^(blocker|major|minor|nit)[|]/) sev++
+                              next }
+    END                     { if (open) exit 0; printf "%s", last }
+  ' "$f" 2>/dev/null
+}
+
+# _text_after_last_findings_block <review-file>
+# Everything the stream said AFTER its last `END FINDINGS`, or the whole file when
+# there is no block at all. The prompt orders the block LAST ("Last, a
+# machine-readable findings block"), so this is the region a finished review has
+# nothing substantive in -- which is what makes it the right place to look for an
+# answer that never started. Internal to review_declined_to_start.
+_text_after_last_findings_block() {
+  awk '/^END FINDINGS/ { tail = ""; next } { tail = tail $0 "\n" }
+       END { printf "%s", tail }' "${1:-}" 2>/dev/null
+}
+
+# review_declined_to_start <review-file>
+# True when the reviewer answered with a PLAN and waited for confirmation instead
+# of reviewing. Exit 0 = it declined (the review is not a review).
+#
+# WHY THIS IS SEPARATE FROM THE BLOCK CHECK (sp-df1a458f, half b). Rejecting the
+# placeholder block is not enough on its own. From round 2 the stream carries the
+# PREVIOUS round's findings for the model to re-prove, so a decline can arrive
+# wrapped around a structurally perfect block full of REAL severity rows. Grading
+# those derives a verdict from findings the reviewer never examined: it wedges the
+# PR on a blocker the author may already have fixed, which is the false-BLOCK half
+# of this defect and costs as much as a false green.
+#
+# ANCHORED AFTER THE LAST BLOCK, NOT ANYWHERE IN THE FILE. A genuine review of
+# THIS script quotes plan-and-await prose in its findings -- that is a real review
+# and must land. Because the prompt puts the block last, decline language after it
+# is the model's own closing answer rather than something it was reading about.
+# Over-refusal here wedges PRs exactly as hard as under-refusal releases them,
+# so the window matters as much as the phrases.
+#
+# The phrases are the two shapes actually recorded ("Reply `OK` and I'll execute
+# exactly that plan." / "Waiting for `OK` to execute the review plan.") plus the
+# nearest generalisations. A herestring, not a pipe: `printf ... | grep -q` returns
+# 141 under `set -o pipefail` when grep exits on the first match before the write
+# finishes, which reads as NO MATCH on exactly the long inputs this sees.
+review_declined_to_start() {
+  local f="${1:-}" tail
+  [ -s "$f" ] || return 1
+  tail="$(_text_after_last_findings_block "$f")"
+  [ -n "$tail" ] || return 1
+  grep -qiE "waiting[[:space:]]+for[[:space:]]+[\`'\"]?(an[[:space:]]+)?(ok|go[- ]ahead|confirmation|approval)|reply[[:space:]]+[\`'\"]?ok[\`'\"]?[[:space:]]+(and|so|then)|say[[:space:]]+[\`'\"]?(ok|go)[\`'\"]?[[:space:]]+and[[:space:]]+i|awaiting[[:space:]]+(your[[:space:]]+)?(confirmation|approval|go[- ]ahead)" <<<"$tail"
+}
+
+# review_is_usable <review-file>
+# THE ONE QUESTION pr-review-agent.sh asks before it lets a stream fill the gate:
+# did a review actually happen here? Both dispatch sites (codex, and the Opus
+# fallback -- where this class last hid, ASK-221) gate on this single predicate,
+# so the two paths cannot drift into different answers about the same file.
+#
+# Usable means BOTH: a complete findings block that is not the prompt's own
+# template, AND an answer that did not stop to ask permission. Either one alone
+# lets a review that never ran set a REQUIRED status.
+review_is_usable() {
+  local f="${1:-}"
+  has_complete_findings_block "$f" || return 1
+  review_could_not_read "$f" && return 1
+  ! review_declined_to_start "$f"
+}
+
+# review_could_not_read <review-file>
+# True when the findings block is EMPTY and the reviewer never stated a verdict
+# extract_verdict recognizes. Exit 0 = nobody can say this review happened.
+#
+# THE SCAR (two instance PRs, 2026-10-13). The codex sandbox had no network,
+# `gh pr diff` failed, and the reviewer stopped honestly ("VERDICT: REVIEW
+# BLOCKED" / "NOT ISSUED") over an EMPTY findings block. An empty block derives
+# APPROVE by contract (a round 2 that refutes everything must land), the stated
+# verdict parsed as nothing, and the PR got a green required check unread.
+#
+# WHY THIS SHAPE (after an independent review measured the earlier shapes over
+# all 711 saved reviews). Hunting for refusal PHRASES never closes ("Final
+# verdict: NOT ISSUED", a table row, no verdict line at all), and a label finder
+# that disagreed with extract_verdict on case refused 41 real reviews. So the
+# rule is stated as the contract itself: an empty block may only derive APPROVE
+# when the reviewer SAID a verdict. Rows present -> a review happened, not this
+# function's call. Empty and a stated verdict (any case) -> usable, and
+# resolve_verdict keeps the harsher of stated and derived. Empty and nothing
+# stated -> unusable, the status stays UNSTATED.
+# The reviewer's OWN words. Codex transcripts interleave `exec` blocks that echo
+# command output (the PR author's diff, fixtures, comments) between `codex`
+# messages, and the final answer follows the LAST line that is exactly `codex`.
+# Only that is read: an echoed "verdict: approve" in the author's text must not
+# turn a refusal into a stated verdict (independent review, 2026-10-13). A
+# transcript with no such marker (claude -p) is all final answer.
+_reviewer_final_answer() {
+  awk '{ lines[NR] = $0 } /^codex[[:space:]]*$/ { last = NR }
+       END { for (i = last + 1; i <= NR; i++) print lines[i] }' "${1:-}" 2>/dev/null
+}
+review_could_not_read() {
+  local f="${1:-}" block upper verdict
+  [ -s "$f" ] || return 1
+  block="$(findings_block "$f")"
+  [ -n "$block" ] || return 1
+  grep -qE '^(blocker|major|minor|nit)\|' <<<"$block" && return 1
+  # extract_verdict matches upper-case labels and tokens; real reviews write
+  # "Verdict:" and "**Verdict: APPROVE WITH NITS.**", so read an upper-cased copy
+  upper="$(mktemp)"
+  _reviewer_final_answer "$f" | tr '[:lower:]' '[:upper:]' > "$upper"
+  verdict="$(extract_verdict "$upper")"
+  rm -f "$upper"
+  [ -z "$verdict" ]
+}
+
+# has_complete_findings_block <review-file>
+# True when the review carries a usable block. DEFINED IN TERMS OF findings_block
+# so the predicate and the extractor cannot answer differently -- it lives here,
+# next to the reader, for exactly that reason.
+#
+# It used to be `grep -q '^FINDINGS:' && grep -q '^END FINDINGS'` inside
+# pr-review-agent.sh: two markers, anywhere, in any order. That passes a review
+# whose only COMPLETE block is a quoted prior round while its real trailing block
+# is truncated -- so the unusable flag stays off, the gate goes green, and the
+# verdict is derived from findings the review had already withdrawn. Two
+# definitions of "complete" in one script is the drift this file exists to stop.
+#
+# DELIBERATELY STRUCTURAL, NOT ROW-COUNTING (ASK-312). Requiring at least one
+# severity row here looks like the obvious hardening and is wrong: a round-2 review
+# that refutes every round-1 finding closes with a legitimately EMPTY block, and
+# `test-findings-block-reader.sh` case 2 pins that shape. Rejecting it would route
+# a real review to the fallback engine and mark the status DEGRADED for finding
+# nothing, which is the opposite of what finding nothing means.
+#
+# "Reviewed, found nothing" and "never started" are byte-identical inside the
+# block. The discriminator is OUTSIDE it -- the reviewer's own STATED verdict --
+# so the fix lives at that comparison, not in this predicate. See
+# verdict_from_findings below and the decline-to-start guard in pr-review-agent.sh.
+has_complete_findings_block() {
+  [ -n "$(findings_block "${1:-}")" ]
+}
+
+# verdict_from_findings <review-file>
+# Derive the verdict MECHANICALLY from the FINDINGS block severities. This is
+# the enforcement half of the severity floor: a prompt telling the reviewer how
+# to grade is not enforcement (no-prompt-only-enforcement), and PR #11 round 4
+# proved the gap is real -- the model reasoned its way to the right call there,
+# but nothing made it. Severity labels are structured data; the verdict is a
+# function of them, so compute it instead of reading prose.
+#   any blocker -> BLOCK            (anchor: unrecoverable if merged)
+#   any major   -> REQUEST CHANGES  (recoverable, but a human must clean up)
+#     ...unless its 4th field is `nonblocking` (ASK-2422, see _blocking_majors)
+#   minors/nits -> APPROVE WITH NITS (captured as follow-ups, never wedges)
+#   none        -> APPROVE
+# Empty when there is no COMPLETE FINDINGS block, so the caller falls back to
+# prose. An unclosed block is now "no block" rather than "an empty block": empty
+# reads as unstated, which holds a PR, where APPROVE released it.
+verdict_from_findings() {
+  local f="$1" block
+  [ -s "$f" ] || return 0
+  block="$(findings_block "$f")"
+  printf '%s' "$block" | grep -q '^FINDINGS:' || return 0
+  if   printf '%s' "$block" | grep -qE '^blocker\|';    then printf 'BLOCK'
+  elif printf '%s' "$block" | _blocking_majors | grep -q .; then printf 'REQUEST CHANGES'
+  elif printf '%s' "$block" | grep -qE '^(major|minor|nit)\|'; then printf 'APPROVE WITH NITS'
+  # An empty block deriving APPROVE is a DELIBERATE contract, pinned by name in
+  # test-severity-floor.sh: a round 2 that refutes everything must be able to land,
+  # or approved PRs wedge forever. ASK-312 tried removing it and collided with that
+  # contract plus test-findings-block-reader.sh case 2. The decline-to-start defect
+  # is not fixed here -- see resolve_verdict below, where the discriminator lives.
+  else printf 'APPROVE'
+  fi
+}
+
+# resolve_verdict <stated> <derived>
+# The ONE place a stated and a derived verdict become the verdict that gets posted.
+#
+# WHY THIS FAILS CLOSED (ASK-312). pr-review-agent.sh used to prefer the derived
+# verdict whenever it existed, printing a NOTE about any disagreement and
+# proceeding. On 2026-08-02 that silently converted a reviewer's own
+# "REQUEST CHANGES" into APPROVE, twice, and posted kipi/reviewer-approved=success
+# on the head SHA of a PR nobody had read. The reviewer had answered "Reply `OK`
+# and I'll run the review exactly as planned" and echoed the prompt's TEMPLATE
+# back: a structurally perfect block with zero rows, which the severity ladder
+# reads as "nothing was wrong" when it meant "nothing was examined".
+#
+# The rule: a disagreement may never resolve TOWARD approval. Deriving a harsher
+# verdict than the reviewer stated is fine and stays -- that is the severity floor
+# doing its job against a reviewer that logged a blocker and then said APPROVE.
+# Deriving a SOFTER one means the two signals contradict each other about whether
+# the PR is safe, and the only safe reading of a contradiction is the harsher side.
+#
+# Ranked least to most permissive; a disagreement resolves to the lower rank.
+verdict_rank() {   # verdict_rank <verdict>
+  case "$1" in
+    BLOCK)                printf '0' ;;
+    "REQUEST CHANGES")    printf '1' ;;
+    "APPROVE WITH NITS")  printf '2' ;;
+    APPROVE)              printf '3' ;;
+    *)                    printf '9' ;;   # unknown/empty: not a verdict
+  esac
+}
+
+resolve_verdict() {   # resolve_verdict <stated> <derived>
+  local stated="${1:-}" derived="${2:-}" sr dr
+  [ -n "$derived" ] || { printf '%s' "$stated"; return 0; }
+  [ -n "$stated" ]  || { printf '%s' "$derived"; return 0; }
+  sr="$(verdict_rank "$stated")"
+  dr="$(verdict_rank "$derived")"
+  # An unrecognised stated verdict cannot vouch for anything, so the derived one
+  # stands alone rather than being averaged with noise.
+  [ "$sr" = "9" ] && { printf '%s' "$derived"; return 0; }
+  if [ "$dr" -le "$sr" ]; then printf '%s' "$derived"; else printf '%s' "$stated"; fi
+}
+
+# pr_merge_state <pr-number>
+# GitHub's mergeStateStatus for a PR: CLEAN | DIRTY | BEHIND | BLOCKED |
+# UNSTABLE | DRAFT | HAS_HOOKS | UNKNOWN, or empty when gh cannot answer.
+# ONE reader of this state, for the same reason this file exists at all: the
+# worker and the driver both need it, and two callers each shelling their own
+# `gh pr view` is two readers of one input with drifting semantics. Empty on any
+# failure, which the gate treats as "still merges" -- see rework_gate.
+pr_merge_state() {
+  # shellcheck disable=SC2086  # scoped by the ONE derivation (ASK-738)
+  gh pr view "$1" ${KIPI_GH_REPO_ARGS:-} --json mergeStateStatus -q .mergeStateStatus 2>/dev/null | tr -d '[:space:]'
+}
+
+# pr_head_sha <pr-number>
+# The commit at the tip of the PR's head branch RIGHT NOW (GitHub's headRefOid),
+# or empty when gh cannot answer. ONE reader, for the same reason pr_merge_state
+# is one: both drivers have to agree on what "the current head" means before they
+# can compare it to the sha a review pinned, and two callers each shelling their
+# own `gh pr view` is two readers of one input with drifting semantics -- the
+# defect class this file exists to close. Empty on any failure, which rework_gate
+# reads as "unknown, fall back and say so", never as drift.
+pr_head_sha() {
+  # $KIPI_GH_REPO_ARGS is set ONCE by whichever script sourced this lib, from
+  # repo-slug-lib.sh (ASK-738). Unquoted so an empty value expands to nothing;
+  # it is never anything but "-R owner/repo" by construction.
+  # shellcheck disable=SC2086
+  gh pr view "$1" ${KIPI_GH_REPO_ARGS:-} --json headRefOid -q .headRefOid 2>/dev/null | tr -d '[:space:]'
+}
+
+# --- the arm-state record (ASK-222, PR #33 review round 3, finding 1) --------
+# record_automerge <path> <armed|unarmed|unknown>   -- written by each ARMER
+#   (linear-worker.sh's arm_automerge, and converge.sh after its own automerge_arm
+#   since ASK-310), always with automerge_arm's answer, so one semantics
+# automerge_from_record <path>                      -- read by everyone else
+#
+# WHY A RECORD AND NOT A SECOND PROBE. linear-worker.sh asks GitHub whether a PR
+# has auto-merge on. converge.sh reports on the same PR minutes later and has to
+# say who merges it. Giving converge its own `gh pr view --json autoMergeRequest`
+# would be two readers of one input with drifting semantics -- the defect class
+# this whole file exists to close, and converge's own call sites refuse it
+# elsewhere. The alternative it reached for instead was an ASSERTION: a comment
+# claiming "the worker arms every PR it touches", which was false for every PR
+# the worker skipped as done, so the founder's phone got "no human merge needed"
+# on PRs nothing had armed. A record is neither: it is the one reader's own
+# answer, published, exactly like the verdict record two functions up.
+#
+# STALENESS, STATED. The record is rewritten every time the worker reaches the
+# PR. A run that never got there (another session's claim, a worktree that could
+# not be made) leaves the previous run's word standing. That is safe in the
+# direction that matters: "armed" goes false only when a human turns auto-merge
+# off or when automerge_disarm does it at gate 50 (ASK-2036) -- the disarmer is
+# the SECOND writer of this record and writes it at the same call site, so the
+# next reader never sees a stale "armed" over a PR it just
+# unqueued. converge re-arms anything recorded "unarmed"/"unknown" or absent
+# (ASK-310), which is a no-op on a PR that is in fact armed. Absent means absent -- the
+# reader gets an empty string and must claim nothing.
+record_automerge() {
+  printf '%s\n' "$2" > "$1" 2>/dev/null || true
+}
+
+automerge_from_record() {
+  [ -s "$1" ] || return 0
+  tr -d '[:space:]' < "$1" 2>/dev/null
+}
+
+# automerge_arm <pr> <dir> [errlog]
+# THE ONE ARM CALL (ASK-310), shared by linear-worker.sh's arm_automerge and by
+# converge.sh's approved branch. converge used to know a PR was approved and
+# unarmed and page "Needs a human: gh pr merge --auto --squash N" (live, ASK-143
+# PR #2, 2026-08-15) instead of running that one command. It cannot source the
+# worker, and a second inline copy of this logic is the drifting-semantics defect
+# arm_automerge's own header refuses. So the gh-facing part lives here, once.
+#
+# Runs in the CALLER's shell, never inside $( ), so these three stay visible:
+#   AUTOMERGE_ARM_STATE  armed | unarmed | unknown   ("" when <pr> is empty)
+#   AUTOMERGE_ARM_NEW    1 when THIS call armed it, 0 otherwise
+#   AUTOMERGE_ARM_ERR    gh's own refusal, one line, "" when it armed
+# Three states, never two: an empty probe answer is "could not tell", not
+# "unarmed" (PR #33 review round 1, finding 3). gh's refusal is KEPT, because a
+# page that says "refused" without gh's words sends a human to re-run it to read
+# them (the worker's copy used to throw it away with >/dev/null 2>&1).
+automerge_arm() {
+  local pr="${1:-}" dir="${2:-.}" errlog="${3:-/dev/null}" probe err
+  AUTOMERGE_ARM_STATE="unknown"; AUTOMERGE_ARM_NEW=0; AUTOMERGE_ARM_ERR=""
+  # `gh pr merge --auto --squash ''` acts on whatever branch the cwd is on.
+  [ -n "$pr" ] || { AUTOMERGE_ARM_STATE=""; return 0; }
+  # Every gh call below runs after `cd "$dir"`. A missing dir failed them all on
+  # the cd, and the page then said "gh printed no reason" when gh never ran
+  # (PR #429 review nit). Name the dir and do not call gh at all.
+  if [ ! -d "$dir" ]; then
+    AUTOMERGE_ARM_ERR="arm dir '$dir' does not exist, so gh never ran"
+    return 0
+  fi
+  if ! probe="$( cd "$dir" && gh pr view "$pr" --json autoMergeRequest \
+                   -q '.autoMergeRequest != null' 2>>"$errlog" )"; then
+    probe="unknown"
+  fi
+  if [ "$probe" = "true" ]; then
+    AUTOMERGE_ARM_STATE="armed"; return 0
+  fi
+  if err="$( cd "$dir" && gh pr merge --auto --squash "$pr" 2>&1 >/dev/null )"; then
+    AUTOMERGE_ARM_STATE="armed"; AUTOMERGE_ARM_NEW=1; return 0
+  fi
+  AUTOMERGE_ARM_ERR="$(printf '%s' "$err" | tr '\n' ' ' | sed 's/  */ /g; s/ $//' | cut -c1-300)"
+  # ASK THE STATE AGAIN before calling it unarmed: an already-armed PR is one of
+  # the reasons `gh pr merge --auto` refuses.
+  if ! probe="$( cd "$dir" && gh pr view "$pr" --json autoMergeRequest \
+                   -q '.autoMergeRequest != null' 2>>"$errlog" )"; then
+    probe="unknown"
+  fi
+  # EMPTY IS "could not tell", as the header promises (PR #429 review nit): gh
+  # can exit 0 with no answer, and that is not a reading of "false".
+  case "$probe" in
+    true)       AUTOMERGE_ARM_STATE="armed"; AUTOMERGE_ARM_ERR="" ;;
+    unknown|"") AUTOMERGE_ARM_STATE="unknown" ;;
+    *)          AUTOMERGE_ARM_STATE="unarmed" ;;
+  esac
+  return 0
+}
+
+# automerge_disarm <pr> <dir> [errlog]
+# THE INVERSE OF automerge_arm, and it exists because arming is UNCONDITIONAL
+# (PR #446 review, finding 1 -- major). linear-worker.sh arms at step 5 forty-two
+# lines BEFORE it runs the review, on purpose: `--auto` is not "merge now", so
+# arming first and letting GitHub hold the PR until every required context is
+# green is the whole design. That design has one hole. The required context
+# `kipi/reviewer-approved` is posted by the reviewer ITSELF, including by the
+# degraded Opus fallback during a codex outage -- so a gate that decides after
+# the review "this approval is not independent" (rework_gate exit 50, ASK-2036)
+# was deciding about a PR GitHub had already been told to land. Not arming at the
+# gate is not enough when something armed it before the gate could see the
+# verdict. The arm has to come back off.
+#
+# THE SAFE DIRECTION IS TO WRITE, NOT TO SKIP. gh is only skipped when the probe
+# says EXPLICITLY false: disabling auto-merge on a PR that does not have it is a
+# harmless no-op, while trusting an unreadable probe as "nothing to do" leaves an
+# unreviewed PR queued to land. Same three-state discipline as the arm, opposite
+# bias, and for the same reason the arm's header gives: an empty probe answer is
+# "could not tell", never a reading.
+#
+# Runs in the CALLER's shell, never inside $( ):
+#   AUTOMERGE_DISARM_STATE  disarmed | armed | unknown   ("" when <pr> is empty)
+#   AUTOMERGE_DISARM_WAS    1 when the probe found it ARMED before this call
+#   AUTOMERGE_DISARM_ERR    gh's own refusal, one line, "" when it disarmed
+# STATE="armed" after this call is the state a caller must PAGE on: gh refused and
+# GitHub still owns the merge on code no independent reviewer read.
+automerge_disarm() {
+  local pr="${1:-}" dir="${2:-.}" errlog="${3:-/dev/null}" probe err
+  AUTOMERGE_DISARM_STATE="unknown"; AUTOMERGE_DISARM_WAS=0; AUTOMERGE_DISARM_ERR=""
+  # `gh pr merge --disable-auto ''` acts on whatever branch the cwd is on, so an
+  # empty number is not "disarm nothing", it is "disarm something else".
+  [ -n "$pr" ] || { AUTOMERGE_DISARM_STATE=""; return 0; }
+  if [ ! -d "$dir" ]; then
+    AUTOMERGE_DISARM_ERR="disarm dir '$dir' does not exist, so gh never ran"
+    return 0
+  fi
+  if ! probe="$( cd "$dir" && gh pr view "$pr" --json autoMergeRequest \
+                   -q '.autoMergeRequest != null' 2>>"$errlog" )"; then
+    probe="unknown"
+  fi
+  # ONLY an explicit false short-circuits. "unknown" and "" fall through to the
+  # write, per the bias stated in the header.
+  if [ "$probe" = "false" ]; then
+    AUTOMERGE_DISARM_STATE="disarmed"; return 0
+  fi
+  [ "$probe" = "true" ] && AUTOMERGE_DISARM_WAS=1
+  if err="$( cd "$dir" && gh pr merge --disable-auto "$pr" 2>&1 >/dev/null )"; then
+    AUTOMERGE_DISARM_STATE="disarmed"; return 0
+  fi
+  AUTOMERGE_DISARM_ERR="$(printf '%s' "$err" | tr '\n' ' ' | sed 's/  */ /g; s/ $//' | cut -c1-300)"
+  # ASK AGAIN before reporting it still armed: "auto-merge is not enabled" is one
+  # of the reasons `gh pr merge --disable-auto` refuses, and that refusal means
+  # the job is already done.
+  if ! probe="$( cd "$dir" && gh pr view "$pr" --json autoMergeRequest \
+                   -q '.autoMergeRequest != null' 2>>"$errlog" )"; then
+    probe="unknown"
+  fi
+  case "$probe" in
+    false)      AUTOMERGE_DISARM_STATE="disarmed"; AUTOMERGE_DISARM_ERR="" ;;
+    true)       AUTOMERGE_DISARM_STATE="armed" ;;
+    *)          AUTOMERGE_DISARM_STATE="unknown" ;;
+  esac
+  return 0
+}
+
+# _sha_norm <sha>
+# Whitespace-stripped, lower-cased sha for comparison. Hex case and a stray
+# newline are not drift. A PREFIX is deliberately NOT treated as a match: both
+# sides of the comparison come from GitHub's full 40-char headRefOid, so a short
+# sha means something unexpected wrote the record, and reading that as "same
+# commit" would be a guess in the never-merge direction's favour.
+_sha_norm() { printf '%s' "${1:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]'; }
+
+# rework_gate <verdict> [merge-state] [reviewed-head-sha] [current-head-sha] [degraded]
+# The deterministic slice of the severity floor: whether another rework round
+# is allowed to start. Exit codes, not prose:
+#   0  = rework      (REQUEST CHANGES or BLOCK -- the review is the spec)
+#   10 = approved    (APPROVE or APPROVE WITH NITS *and it still merges* --
+#                     nothing to rework; the PR waits on the founder. Minors
+#                     were captured, not wedged.)
+#   20 = unreviewed  (no verdict -- with no review there is no spec; refuse and
+#                     point at `kipi review <PR#> --post` instead of guessing)
+#   30 = conflicted  (approved, but it no longer merges -- a REBASE round, not a
+#                     review round. Distinct from 0 so the caller can cap it
+#                     separately; see the caller-owned cap note below.)
+#   40 = stale       (approving, but at a sha that is no longer the PR's head --
+#                     re-review at the new sha. NEVER merge, never auto-approve.)
+#   50 = degraded    (approving, at the right sha, but the ONLY review on record
+#                     was written by the Opus fallback during a codex outage. Not
+#                     an independent second opinion, so it does not satisfy the
+#                     review precondition on its own. NEVER merge; re-review once
+#                     codex answers. See the degraded section below.
+#                     DORMANT WHILE THE FLEET IS CLAUDE-PRIMARY: the writer sets
+#                     the flag only on the codex-outage branch, so nothing on the
+#                     scheduled path produces a 50 today. Correct and waiting,
+#                     not passing -- the scope note on degraded_from_record says
+#                     what it takes to arm it and why that is not this gate's
+#                     call.)
+#
+# WHY MERGEABILITY IS PART OF THE GATE (ASK-212, sp-71b63e62)
+# ----------------------------------------------------------
+# A verdict is a statement about a diff at a moment. The merge state is a
+# statement about that diff against main NOW, and main moves underneath it. PR
+# #11 was approved at 06:08Z; #16 landed at 17:30Z and broke it. Reading the
+# verdict alone, both converge and a direct worker run skipped #11 in under two
+# seconds and reported "waiting on founder merge only" -- so the loop could not
+# dispatch the one thing actually blocking the merge, and a human had to
+# diagnose it by hand. An approved PR that does not merge is not done.
+#
+# ONLY A STATED DIRTY OR BEHIND COUNTS. BLOCKED is a branch-protection state a
+# rebase cannot fix, UNSTABLE is a failing non-required check, UNKNOWN is GitHub
+# still computing, and empty is gh failing. Treating any of those as a conflict
+# would manufacture rebase rounds on healthy PRs every time the API was slow --
+# the wrong-refusal failure that would stall every instance's worker at once.
+# Fail toward "terminal": a missed conflict costs one human diagnosis, a
+# manufactured one costs unbounded model budget on every PR at once.
+#
+# 30 IS NOT 0, AND THE CAP IS THE CALLER'S (PR #22 round-3 review, finding 4)
+# --------------------------------------------------------------------------
+# Making APPROVE non-terminal opens an unbounded rework path: an unresolvable
+# conflict yields infinite rounds, and every round writes a permanent Linear
+# comment on an object that cannot be deleted. So this returns a DISTINCT code
+# rather than folding into 0. The caller caps conflict rounds on its own budget,
+# separate from the review-round budget -- a PR that has converged on content
+# must not lose its review rounds to rebase attempts. The gate answers "is this
+# a conflict?"; it does not answer "have we tried enough times?", because the
+# round ledger lives with the caller that owns the dispatch.
+#
+# The ONE-ARGUMENT form keeps its original semantics exactly (no merge state
+# supplied reads as "still merges"), because converge.sh calls it that way and a
+# silent behaviour change on the short form is a fleet-wide bug.
+#
+# WHY THE SHA IS PART OF THE GATE (ASK-216, sp-12f99480)
+# ------------------------------------------------------
+# A verdict record keyed on a PR NUMBER says "this PR was approved", never "this
+# CODE was approved". The worker reuses one branch and one PR across rework
+# rounds (linear-worker.sh:328), so every push landing after an approval
+# inherited that approval silently. Today that is a stale skip; under an
+# integrator it is an auto-merge of code no reviewer ever read, on a repo whose
+# main fans out fleet-wide through `kipi update`. pr-receipt-gate.py already
+# reasons this way with --head-sha; a verdict is the same class of claim.
+#
+# ABSENT IS NOT DRIFT. Every record written before this change lacks the field,
+# so absent falls back to verdict-only and SAYS SO on stdout -- reading
+# absent-as-drift would re-review every converged PR on the board at once. Same
+# posture when the CURRENT head cannot be read: fail toward terminal, exactly as
+# an empty merge state does above. A manufactured re-review round costs the
+# whole fleet at once; a missed one costs a single human diagnosis.
+#
+# DRIFT OUTRANKS THE MERGE STATE. When both fire, the sha wins: a rebase round
+# dispatched on a diff nobody reviewed is the same unreviewed-code path wearing
+# a rebase coat. Re-review first; the fresh record then decides.
+#
+# 40 IS NOT 10 AND NOT 30. Callers passing 1 or 2 arguments (converge.sh,
+# linear-worker.sh -- neither touched by this issue) can never see it, and a
+# caller that does not know 40 falls out of its if-chain into the rework path,
+# which is the safe direction: not terminal, never a merge.
+#
+# WHY DEGRADED IS PART OF THE GATE (ASK-2036, sp-e9284708)
+# --------------------------------------------------------
+# During a codex outage pr-review-agent.sh runs the Opus fallback so
+# `kipi/reviewer-approved` -- a REQUIRED context -- does not wedge every PR in
+# the repo. That status posts SUCCESS. The record it writes says
+# `degraded: true` and `reviewed_by: claude-opus-5`, and the human-facing
+# surfaces (the status description, the Linear comment) say DEGRADED out loud.
+# THIS function said nothing, because nothing read the flag: for three weeks the
+# only consumer of `degraded` was a python heredoc inside
+# test-review-degraded-provenance.sh. So a fallback APPROVE reached exit 10
+# exactly like an independent one, the worker ARMED auto-merge on it, and a PR
+# reviewed only by the same model family that wrote the code could land. The
+# whole reason this loop pays for a second engine is that the checker is not
+# Claude; a degraded approval is that property quietly switched off.
+#
+# 50 IS NOT 20, and the distinction is what a caller says to the operator.
+# 20 means nobody reviewed it and there is no spec. 50 means a review happened,
+# found nothing, and was written by the wrong reader -- the code may well be
+# fine, it has simply never been independently read. Both hold the PR; only one
+# of them is fixed by re-running the review once codex answers.
+#
+# DRIFT OUTRANKS DEGRADED, for the same reason drift outranks the merge state: a
+# moved head means nobody read the code at ALL, so the re-review has to happen
+# first and the record it writes then decides independence. DEGRADED OUTRANKS
+# THE CONFLICT, because rebasing code nobody independently read does not make it
+# read, and a rebase round would spend the conflict budget on the wrong problem.
+#
+# ABSENT IS NOT INDEPENDENT AND IT IS NOT DEGRADED. The 5th argument is empty for
+# every record written before ASK-445, for a corrupt record, and for every caller
+# that has not been taught to pass it -- all three keep today's behaviour exactly.
+# That is deliberate and it is the expensive half to get wrong: reading absent as
+# degraded would stop every open PR on the board at once the day this shipped.
+#
+# 50 IS NOT 10, 30 OR 40. A caller that does not know 50 falls out of its
+# if-chain into the rework path, which is the same safe direction 40 relies on:
+# not terminal, never a merge.
+rework_gate() {
+  local verdict="${1:-}" merge_state="${2:-}" reviewed_sha="${3:-}" current_sha="${4:-}"
+  local degraded="${5:-}"
+  case "$verdict" in
+    "REQUEST CHANGES"|"BLOCK")            return 0 ;;
+    "APPROVE"|"APPROVE WITH NITS")
+      # Silent unless a caller actually asked for the sha check, so the short
+      # forms stay byte-identical and no line is printed on every worker run.
+      if [ -n "$reviewed_sha" ] || [ -n "$current_sha" ]; then
+        if [ -z "$reviewed_sha" ]; then
+          echo "  NOTE: no head_sha in this verdict record (written before ASK-216) -- cannot tell an approval from one inherited by a later push; falling back to verdict-only"
+        elif [ -z "$current_sha" ]; then
+          echo "  NOTE: could not read the PR's current head_sha; not manufacturing a re-review round on an unreadable head"
+        elif [ "$(_sha_norm "$reviewed_sha")" != "$(_sha_norm "$current_sha")" ]; then
+          return 40
+        fi
+      fi
+      # THE ONE NEW READ (ASK-2036). One line on purpose: the mutation in
+      # test-degraded-approval-gate.sh deletes exactly this line and requires the
+      # degraded case to fall back to 10, which is only a real kill if removing
+      # it leaves the rest of the function intact.
+      case "$degraded" in 1) return 50 ;; esac
+      case "$merge_state" in
+        "DIRTY"|"BEHIND")                 return 30 ;;
+        *)                                return 10 ;;
+      esac ;;
+    *)                                    return 20 ;;
+  esac
+}
+
+# extract_minor_findings <review-file>
+# Prints the `minor|claim|file:line` lines from the review's FINDINGS block
+# (the machine-readable block the reviewer prompt requires after the verdict).
+# Soft by design: an LLM that ignores the format yields zero lines, and the
+# caller logs the zero -- capture can miss, it must never invent.
+extract_minor_findings() {
+  local f="$1"
+  [ -s "$f" ] || return 0
+  findings_block "$f" | grep -E '^minor\|' || true
+}
+
+# THE ROW SHAPE, and the one rule every reader below shares (ASK-2422).
+#
+# A findings row is `severity|claim|file:line` with an OPTIONAL trailing mark.
+# The claim is the only free-text field, so it is the only field that can hold a
+# literal `|` -- and when it does, every positional field shifts right.
+#
+# SCAR, round 1 of this very issue: the first version read the mark off field 4.
+# A reviewer writing `major|the fallback swallows rc=2 | rc=3|a.sh:40|nonblocking`
+# put the mark on $5, field 4 held the location, the row read as blocking, and the
+# PR the reviewer had explicitly released wedged anyway -- silently, because the
+# row still looked well-formed. The fix is to anchor on the END of the row, which
+# does not move: the mark is the LAST field, and only when the row has at least 4
+# of them, so a row whose LOCATION is the word `nonblocking` releases nothing.
+#
+# This awk fragment is the single owner of that rule. Every reader interpolates it
+# rather than restating the comparison, so the three call sites cannot drift.
+_NB_MARK_AWK='function nb(  m) { m = $NF; gsub(/[ \t\r]/, "", m); return (NF >= 4 && m == "nonblocking") }'
+
+# _blocking_majors (stdin: a findings block)
+# The major rows that gate: every `major|claim|loc` row EXCEPT one carrying the mark.
+#
+# WHY THE MARK EXISTS (ASK-2422). A report-only gate PR took 4 review rounds, and
+# round 4's only major was one the reviewer itself called "not a blocker"; the next
+# PR's round 3 said the same words about its major. The ladder read `^major|` and
+# nothing else, so a reviewer had no way to put that judgment in the block, and its
+# own prose could not move the verdict. The mark is for a major the reviewer judges
+# safe to merge and fix after, including one that only bites in code the PR states
+# is report-only or dry-run. A blocker never reads the mark: real blockers block.
+#
+# EXACT FIELD, NOT A SUBSTRING. A location like `nonblocking.py:3` or a claim that
+# mentions the word must not release a gate; only the trailing field does.
+_blocking_majors() {
+  awk -F'|' "$_NB_MARK_AWK"' /^major[|]/ { if (!nb()) print }'
+}
+
+# extract_followup_findings <review-file>
+# What a terminal APPROVE WITH NITS leaves behind to fix: the minors, plus every
+# major the reviewer marked `nonblocking`. A released major is still a real defect;
+# it is listed with the minors so it reaches the run log, never dropped (ASK-2422).
+extract_followup_findings() {
+  local f="$1" block
+  [ -s "$f" ] || return 0
+  block="$(findings_block "$f")"
+  [ -n "$block" ] || return 0
+  printf '%s\n' "$block" | awk -F'|' "$_NB_MARK_AWK"'
+    /^minor[|]/ { print; next }
+    /^major[|]/ { if (nb()) print }'
+}
+
+# findings_row_parts <row>
+# Splits ONE findings row into severity, claim and location, on three lines in
+# that order, with the optional trailing mark removed.
+#
+# WHY A FUNCTION AND NOT `IFS='|' read -r sev claim loc`. That read is the same
+# positional parse the scar above describes: a claim containing a pipe lands its
+# tail in `loc`, so the run log names a location the reviewer never wrote. Here
+# the location is the last field before the mark and the claim is everything
+# between, so an internal pipe is preserved rather than mistaken for a delimiter.
+findings_row_parts() {
+  printf '%s' "$1" | awk -F'|' "$_NB_MARK_AWK"'
+    {
+      last = nb() ? NF - 1 : NF
+      if (last < 3) { print $1; print $2; print ""; next }
+      claim = $2
+      for (i = 3; i < last; i++) claim = claim "|" $i
+      print $1; print claim; print $last
+    }'
+}
+
+# review_comment_body <review-file> <verdict> <engine> <degraded>
+# Renders the review as something a GitHub comment can actually hold.
+#
+# WHY IT EXISTS (sp-b418be32). `--post` piped the raw review file straight into
+# `gh pr comment --body-file`. A codex review is not a review-shaped document: it
+# is the agent's whole stdout. Measured on PR #34: 435,280 and 519,377 bytes,
+# against GitHub's 65,536-byte comment limit. So EVERY post failed, the caller
+# logged `WARN: could not comment on PR` and carried on, and the commit status it
+# then wrote had no target_url. A human opening the PR saw a bare green check with
+# nothing behind it -- the reviewer ran, cost real spend, and left no readable trace.
+#
+# NOT A NOISE PROBLEM, so trimming is not the fix. The harness header is 14 lines
+# of 10,130. The bulk is the codex agent's own transcript, INCLUDING the diff it
+# read -- which is why that file carries 11 `FINDINGS:` markers instead of one.
+# The reviewer's actual message is the last ~250 lines. A 500KB transcript is a
+# debugging artifact; GitHub is not an artifact store, and splitting it across
+# eight comments would put eight comments of transcript on the PR.
+#
+# THE VERDICT AND FINDINGS DO NOT COME FROM THE TRUNCATED TEXT. They are taken
+# from the caller's already-derived verdict and from `findings_block` (THE ONE
+# READER), then printed ABOVE the tail. That ordering is the whole safety
+# property: truncation can drop narrative, never the two facts a human needs to
+# act. Deriving them from a tail we just cut would be a second reader with its
+# own semantics, the defect class this file exists to stop.
+#
+# The engine is named in the body, not just the status description, for the same
+# reason post_reviewer_status names it: a review whose reader is unknown is worth
+# little, and the point of this loop is that the checker is not Claude.
+review_comment_body() {
+  local f="$1" verdict="${2:-}" engine="${3:-}" degraded="${4:-0}"
+  local limit="${KIPI_REVIEW_COMMENT_LIMIT:-60000}"
+  local bytes head_bytes block block_bytes
+  bytes="$(wc -c <"$f" 2>/dev/null | tr -d ' ')"; bytes="${bytes:-0}"
+  block="$(findings_block "$f")"
+  [ -n "$block" ] || block="(no complete findings block parsed from this review)"
+
+  printf '## Verdict: %s\n\n' "${verdict:-unstated}"
+  [ "$degraded" = "1" ] \
+    && printf '**DEGRADED**: codex was down, this is the Opus fallback. Not an independent second opinion.\n\n'
+  printf 'Reviewer engine: `%s`. Full review on disk: `%s` (%s bytes).\n\n' \
+    "${engine:-unknown}" "$f" "$bytes"
+  # `$(...)` strips the trailing newline off the block, so the closing fence needs
+  # its own \n. Without it the fence glues onto `END FINDINGS`, which both breaks
+  # the code block on GitHub and makes the rendered block differ from
+  # findings_block's output -- caught by case 4, which is exactly what that
+  # byte-identity assertion is for.
+  printf '```\n%s\n```\n\n' "$block"
+
+  # Byte-bounded, then snapped FORWARD to a line boundary. `tail -c` alone can
+  # open mid-line and, worse, mid-UTF-8-sequence: these reviews contain typographic
+  # quotes, so a blind byte cut can emit an invalid sequence. Dropping the first
+  # partial line costs nothing and keeps the body valid text.
+  # MEASURE THE HEADER, DO NOT ASSUME IT (codex round 5 on PR #47, minor). The
+  # reservation used to be a flat 5,000 bytes, but the findings block inside the
+  # header is UNBOUNDED -- a review with many findings, or one long claim string,
+  # blows past it and the rendered body exceeds the very limit this function
+  # exists to guarantee. A cap that a large input can overrun is not a cap.
+  #
+  # The block is already in hand ($block), so its size is a fact, not an estimate.
+  # The fixed number stays only as the allowance for the surrounding prose.
+  # BYTES, NOT CHARACTERS (codex round 7, minor). `${#block}` counts CHARACTERS,
+  # and these reviews are full of typographic quotes and dashes that are 2-3 bytes
+  # each in UTF-8. So the budget under-counted the block by exactly the amount that
+  # matters, and a findings block of multi-byte text could push the body past both
+  # the configured cap and GitHub's. The whole point of measuring the block instead
+  # of reserving a flat 5,000 was to stop guessing; measuring it in the wrong unit
+  # is still guessing.
+  block_bytes="$(printf '%s' "$block" | wc -c | tr -d ' ')"
+  head_bytes=$(( $(review_comment_body_header_size) + ${block_bytes:-0} ))
+  local room=$(( limit - head_bytes ))
+  # A findings block alone can now exceed the limit. Truncating findings would
+  # drop the one thing a human must act on, so the narrative goes to zero first
+  # and the block is still printed whole -- deliberately overrunning rather than
+  # silently losing a finding. The caller's failure branch then reports it, which
+  # is a loud failure instead of a quiet omission.
+  [ "$room" -gt 512 ] || room=0
+  if [ "${bytes:-0}" -gt "$room" ]; then
+    printf -- '--- reviewer output, last %s bytes of %s (full review at the path above) ---\n\n' \
+      "$room" "$bytes"
+    tail -c "$room" "$f" 2>/dev/null | tail -n +2
+  else
+    printf -- '--- reviewer output ---\n\n'
+    cat "$f"
+  fi
+}
+
+# review_comment_body_header_size
+# Byte budget reserved for everything review_comment_body prints ABOVE the tail.
+# A fixed reservation, not a measurement: measuring would mean rendering the
+# header twice and the two copies could disagree. Generous on purpose -- a
+# findings block runs to a few KB at most, and over-reserving only shortens the
+# narrative, while under-reserving overruns the limit and loses the whole comment.
+review_comment_body_header_size() { printf '%s' 5000; }
+
+# repo_visibility <slug>
+# Prints PRIVATE or PUBLIC. Only an exact PRIVATE answer from GitHub is private.
+#
+# WHY IT FAILS CLOSED (ASK-2893). review_comment_body above posts the review's
+# narrative, and on a codex or claude transcript that narrative REPLAYS THE DIFF.
+# On the public kipi-system repo that put 188 term-carrying comments on public
+# PRs (scan of 2026-10-22), each one up to 55 KB, and a scrub PR leaked the very
+# terms it was removing, because the removed lines are in its diff. So the
+# question "may the full review go on this PR" has one safe default: no. A failed
+# lookup, an empty answer, an unknown slug and INTERNAL (visible to a whole
+# enterprise) all read PUBLIC. A private repo that reads PUBLIC by mistake loses
+# a comment's narrative; a public repo that reads PRIVATE leaks.
+#
+# The visibility comes from the repo itself, never from a list of repo names:
+# the reviewer is skeleton code that runs on every fleet repo, and a hardcoded
+# list is stale the day a repo flips.
+repo_visibility() {
+  local slug="${1:-}" v=""
+  v="$(gh repo view ${slug:+"$slug"} --json visibility -q .visibility 2>/dev/null)" || v=""
+  case "$v" in
+    PRIVATE) printf 'PRIVATE' ;;
+    *)       printf 'PUBLIC' ;;
+  esac
+}
+
+# private_terms_check <guard.py>   (stdin: the text that would be posted)
+# Exit 0: the guard loaded a term list and found no term. 1: a term hit.
+# 2: could not check (no guard file, import failure, or no term source on this
+# machine). The caller treats anything but 0 as a hit. It never prints a term:
+# this runs inside a review log, and a hit printed there is a second leak.
+#
+# Loads the guard by path, the same module the commit hook runs, so the reviewer
+# and the commit gate can never disagree about what a private term is. Both guard
+# APIs are accepted: load_tokens() on main as of 2026-10-23, and load_terms() from
+# the ASK-2058 guard rewrite (PR #554). hits() returns a list in one and a dict in
+# the other; both are empty when clean.
+private_terms_check() {
+  local guard="${1:-}"
+  [ -n "$guard" ] && [ -f "$guard" ] || return 2
+  python3 -I -c '
+import importlib.util, sys
+try:
+    spec = importlib.util.spec_from_file_location("kipi_client_name_guard", sys.argv[1])
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if hasattr(mod, "load_terms"):
+        terms = mod.load_terms(warn=lambda _msg: None)
+    else:
+        terms = mod.load_tokens()
+    if terms is None:
+        sys.exit(2)
+    found = mod.hits(sys.stdin.read(), terms)
+except SystemExit:
+    raise
+except Exception:
+    sys.exit(2)
+sys.exit(1 if found else 0)
+' "$guard" 2>/dev/null
+}
+
+# _public_verdict <verdict> / _public_engine <engine>
+# Only a value from a closed set may reach a public PR. The verdict is already
+# one of the four tokens extract_verdict knows or empty, but this function is the
+# public gate, so it does not lean on a property of a reader 900 lines away.
+_public_verdict() {
+  case "${1:-}" in
+    "APPROVE"|"APPROVE WITH NITS"|"REQUEST CHANGES"|"BLOCK") printf '%s' "$1" ;;
+    *) printf 'unstated' ;;
+  esac
+}
+_public_engine() {
+  case "${1:-}" in claude|codex) printf '%s' "$1" ;; *) printf 'unknown' ;; esac
+}
+
+# _public_finding_counts <review-file>
+# Prints "total blocker major minor nit nonblocking-majors", or nothing when no
+# complete findings block was parsed. Through findings_block, the one reader, so
+# the counts on the PR are the counts the verdict was derived from. The last
+# field uses _NB_MARK_AWK, the one owner of the nonblocking rule (PR #557 round
+# 2, minor): "major 1" beside an approving verdict reads as a contradiction
+# unless the summary says the reviewer released it.
+_public_finding_counts() {
+  local block
+  block="$(findings_block "$1")"
+  [ -n "$block" ] || return 0
+  printf '%s\n' "$block" | awk -F'|' "$_NB_MARK_AWK"'
+    /^(blocker|major|minor|nit)[|]/ { n[$1]++; t++ }
+    /^major[|]/ { if (nb()) nbm++ }
+    END { printf "%d %d %d %d %d %d", t, n["blocker"], n["major"], n["minor"], n["nit"], nbm }'
+}
+
+# review_public_counts_line <review-file> <verdict> [degraded]
+# The floor: a closed-set verdict, one integer and fixed words. Nothing from the
+# review text and no path, so there is nothing in it for the guard to find.
+# The DEGRADED words stay even here (PR #557 round 1, minor): an Opus-fallback
+# verdict that reads as an independent second opinion is a false claim, and the
+# floor is no place to start making one.
+review_public_counts_line() {
+  local counts total deg=""
+  counts="$(_public_finding_counts "$1")"
+  total="${counts%% *}"
+  [ "${3:-0}" = "1" ] && deg="DEGRADED (Opus fallback, not an independent second opinion). "
+  printf '%sVerdict: %s. Findings: %s. Review withheld: this repository is public.\n' \
+    "$deg" "$(_public_verdict "${2:-}")" "${total:-not parsed}"
+}
+
+# review_public_body <review-file> <verdict> <engine> <degraded> <guard.py>
+# What the reviewer may post on a PUBLIC repo (ASK-2893): the verdict, the finding
+# counts by severity, the engine, and where the full review sits on the
+# reviewer's machine. No review text, no finding text, no diff. The findings
+# still reach the linked Linear issue, which is private.
+#
+# THEN THE GUARD, on exactly these bytes. The path carries the repo slug, and a
+# slug can collide with a private term (the 2026-10-22 scrub hit one: a token in
+# client-tokens was the founder's own public repo name). On a hit, or when the
+# guard cannot vouch, the body drops to review_public_counts_line.
+review_public_body() {
+  local f="$1" verdict="${2:-}" engine="${3:-}" degraded="${4:-0}" guard="${5:-}"
+  local counts total b m mi n nbm mdesc shown body rc=0
+  counts="$(_public_finding_counts "$f")"
+  shown="$f"
+  case "$f" in "$HOME"/*) shown="~${f#"$HOME"}" ;; esac
+  body="$(
+    printf '## Verdict: %s\n\n' "$(_public_verdict "$verdict")"
+    [ "$degraded" = "1" ] \
+      && printf '**DEGRADED**: codex was down, this is the Opus fallback. Not an independent second opinion.\n\n'
+    if [ -n "$counts" ]; then
+      read -r total b m mi n nbm <<<"$counts"
+      mdesc="$m"
+      [ "${nbm:-0}" -gt 0 ] && mdesc="$m, $nbm of them marked nonblocking by the reviewer"
+      printf 'Findings: %s (blocker %s, major %s, minor %s, nit %s). Reviewer engine: `%s`.\n\n' \
+        "$total" "$b" "$mdesc" "$mi" "$n" "$(_public_engine "$engine")"
+    else
+      printf 'Findings: not parsed (no complete findings block in the review). Reviewer engine: `%s`.\n\n' \
+        "$(_public_engine "$engine")"
+    fi
+    printf 'This repository is public, so the review text, the finding details and the diff are not posted here. Full review on the reviewer machine: `%s`.\n' "$shown"
+  )"
+  printf '%s' "$body" | private_terms_check "$guard" || rc=$?
+  if [ "$rc" = 0 ]; then
+    printf '%s\n' "$body"
+  else
+    echo "  public repo: the summary did not clear the private-terms guard (rc=$rc; 1 = term hit, 2 = could not check). Posting the counts-only line." >&2
+    review_public_counts_line "$f" "$verdict" "$degraded"
+  fi
+}
+
+# review_round <reviews-dir> <pr-number> [repo-slug]
+# Which round the NEXT review of this PR will be: existing review files + 1.
+# Derived from disk, not from the worker's attempts json, because the reviewer
+# also runs standalone (`kipi review 11`) where that counter is never bumped --
+# it would report round 1 forever and the anti-re-litigation rule would never arm.
+#
+# IT COUNTS WHAT THE WRITER WRITES, AND IT NO LONGER SPELLS THE NAME (ASK-1957).
+# This used to glob a literal `pr-<N>-*.md`. ASK-738 re-keyed every review
+# artifact by repo and the writer followed; this counter did not, so for any repo
+# that resolves a slug -- which is every repo, since slug_for_repo falls back to
+# the target's own origin url -- the glob matched nothing. It returned 1 on every
+# run and ROUND_RULE never armed once, exactly the failure the round rule exists
+# to prevent. The pattern now comes from repo-slug-lib.sh's single convention, so
+# the next move of that shape takes both sides with it.
+#
+# THE SLUG IS OPTIONAL, AND AN ABSENT ONE IS THE LEGACY SHAPE BY CONSTRUCTION:
+# artifact_key with an empty slug is `pr-<N>`, so the two-argument form every
+# pre-ASK-738 caller and fixture uses keeps its exact previous behaviour.
+#
+# IT DOES NOT ALSO COUNT THE LEGACY SHAPE for a slugged repo. A union looks like
+# the kind thing to do for the ~88 pre-ASK-738 files at the root of the live
+# store, and it would reopen the collision ASK-738 closed: those files are the
+# HOME repo's, and counting them toward a client repo's PR #42 inflates that PR's
+# rounds with reviews of another repository's code. Their own PRs are long merged;
+# the counter has been answering 1 for them since ASK-738 either way.
+#
+# `find -name`, not a glob against the directory: the pattern arrives as one
+# quoted argument, so a reviews directory containing a space or a trailing slash
+# cannot split it or silently stop matching.
+review_round() {
+  local dir="$1" pr="$2" slug="${3:-}" n
+  n="$(find "$dir" -maxdepth 1 -type f -name "$(review_md_name_glob "$slug" "$pr")" 2>/dev/null | wc -l | tr -d ' ')"
+  printf '%s' $(( ${n:-0} + 1 ))
+}
+
+# verdict_from_record <verdict-json>
+# Reads the `verdict` field of a pr-<N>.verdict.json record. Empty on any
+# parse failure -- a corrupt record reads as unreviewed, which fails closed.
+verdict_from_record() {
+  local f="$1"
+  [ -s "$f" ] || return 0
+  python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("verdict",""))
+except Exception: pass' "$f" 2>/dev/null || true
+}
+
+# head_sha_from_record <verdict-json>
+# Reads the `head_sha` field: the commit the review actually examined. EMPTY for
+# every record written before ASK-216, for a corrupt record, and for a run where
+# `gh` could not answer -- all three are the same thing to rework_gate, which
+# reads empty as "unknown, fall back and say so", never as drift.
+head_sha_from_record() {
+  local f="$1"
+  [ -s "$f" ] || return 0
+  python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("head_sha","") or "")
+except Exception: pass' "$f" 2>/dev/null || true
+}
+
+# degraded_from_record <verdict-json>
+# THREE-VALUED, and the third value is the whole point:
+#   1   the record says degraded -- codex was down and the Opus fallback wrote
+#       this review, so it is not a second lab's opinion
+#   0   the record says NOT degraded -- the primary slot was NOT filled by the
+#       codex-outage Opus fallback. THAT IS ALL IT SAYS. See the scope note.
+#   ""  the record has no `degraded` key, is corrupt, or does not exist
+#
+# WHAT `0` DOES NOT MEAN (PR #446 round 3, finding 1). This line used to read
+# "a real independent review", which is wider than anything the writer records.
+# `DEGRADED=1` is assigned at exactly ONE place in pr-review-agent.sh, inside
+# the codex-outage branch, and both engine defaults there have read `claude`
+# since the founder directive of 2026-09-06. pr-review-agent.sh:38-70 records
+# that posture in full, including the cost it accepts out loud: "Sana (the PR
+# author) is Claude, so a Claude reviewer shares her lab and model family and
+# re-derives her blind spots". So on the path the worker actually runs, every
+# record carries `degraded: false` -- and under the old wording that sentence
+# certified Claude reviewing Claude as the independent second opinion.
+#
+# The consequence for gate 50, stated rather than left to be discovered: it is
+# CORRECT AND DORMANT while the fleet is claude-primary. It fires on the codex
+# outage path, which is reachable today only via an `--engine codex` run.
+# Arming it on the scheduled path is `KIPI_REVIEW_ENGINE=codex
+# KIPI_REVIEW_PRIMARY_ENGINE=codex` (both together, or the two defaults flipped
+# back) -- the founder's 2026-09-06 call, not this reader's to make. The other
+# route, marking a claude-primary review non-independent in the writer, is what
+# ASK-2036's DoR excludes in its own words: "Not changing what the writer
+# records." Tracked separately; case 9 of test-degraded-approval-gate.sh pins
+# this contract so the overclaim cannot come back quietly.
+#
+# WHY IT EXISTS (ASK-2036, sp-e9284708). `degraded` shipped in ASK-445 and for
+# three weeks NOTHING in production read it. The only consumer was a python
+# heredoc defined inside test-review-degraded-provenance.sh, so the fail-safe
+# that suite proves lived entirely inside that suite. Meanwhile the fallback's
+# APPROVE reached the same waiting-on-merge branch a real codex APPROVE reaches,
+# and the worker armed auto-merge on it -- the independence the codex engine
+# exists to buy was gone and no gate could tell. A field with a schema, a writer
+# and no reader is documentation, not a control.
+#
+# EMPTY IS NOT FALSE, and forcing it to be would be the expensive mistake. Every
+# record written before ASK-445 lacks the key. Reading absent as `true` would
+# re-review every historical record on every open PR at once; reading it as
+# `false` would let a legacy record claim an independence nobody verified. Both
+# are guesses, and "I cannot tell" is the honest answer -- rework_gate treats it
+# exactly as it treats an absent head_sha: fall back to today's behaviour and
+# change nothing.
+degraded_from_record() {
+  local f="$1"
+  [ -s "$f" ] || return 0
+  python3 -c 'import json,sys
+try:
+    r = json.load(open(sys.argv[1]))
+    if "degraded" in r: print("1" if r["degraded"] else "0")
+except Exception: pass' "$f" 2>/dev/null || true
+}

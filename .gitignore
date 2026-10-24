@@ -1,26 +1,207 @@
-# OS / editor cruft
+# Secrets and local overrides
+.env
+*.env
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Local security-remediation working dir (settings backups, scan dumps,
+# canary scripts) — contains real/old tokens, never belongs in this repo
+security-remediation/
+
+# OS
 .DS_Store
-**/.DS_Store
+Thumbs.db
 
-# Python
+# Output (generated daily, don't commit)
+# ASK-605: the whole directory, not a list of extensions. auto-commit.py
+# declares q-system/output/ skip-because-gitignored; when that claim was
+# only true for *.html/*.json/*.log, a .md file there was invisible to the
+# hook AND blocked every fleet sync. Keep the negation for .gitkeep so the
+# directory survives a clone.
+q-system/output/**
+!q-system/output/.gitkeep
+q-system/output/*.html
+q-system/output/*.json
+q-system/output/*.log
+q-system/output/drafts/*
+q-system/output/lead-gen/*
+q-system/output/design-partner/*
+q-system/output/content-intel/*
+q-system/output/investor-updates/*
+q-system/output/marketing/linkedin/*
+!**/.gitkeep
+# RCAs are the record, not exhaust. The `**` rule above swallowed them, so no
+# RCA ever reached git and a lost checkout lost every postmortem. Git cannot
+# re-include a file under an excluded parent, so the directory is re-included
+# first, then its .md files only: a wider `**` would beat the secrets and
+# OS stanzas (last match wins) and re-include a .env there. build-template-repo.sh copies this file, so new
+# instances get the rule too.
+!q-system/output/rca/
+!q-system/output/rca/*.md
+
+# Plans (auto-created by Claude Code)
+.claude/plans/
+
+# Agent claim-lock: per-working-tree local state. Committing it would share one
+# session's claim with every clone and the lock would refuse everyone forever.
+.linear-claims.json
+.linear-claims.json.guard
+
+# Session transcripts
+*.jsonl
+# ...but this one is not a transcript, it is the repo's own closure-evidence
+# ledger. test-updater-issue-sequence.py audits it against real commit ancestry,
+# and the blanket ignore above meant it never reached a fresh clone -- so in CI
+# every issue read as "no closure receipt" while passing locally off an untracked
+# working copy. Verified 2026-07-26: structural ids and timestamps only, no
+# free-text, safe for a public repo.
+!.prd-os/receipts.jsonl
+
+# SQLite databases (generated at runtime)
+*.db
+
+# Generated sites and build output
+sites/
+template-repo/
+
+# Bus data (daily pipeline, ephemeral)
+q-system/.q-system/agent-pipeline/bus/
+
+# Obsidian vault config (user-specific, not committed)
+q-system/.obsidian/
+
+# Raw source transcripts (instance-specific, 90-day retention)
+q-system/sources/*.md
+
+# Pruned markdown archives (historical, not loaded in context)
+q-system/memory/archives/
+
+# Session-scoped recall artifact for memory auto-capture (PRD prd-memory-autocapture)
+q-system/memory/.session-recall.json
+q-system/memory/.session-recall.json.lock
+q-system/memory/.session-recall.json.tmp-*
+
+# Node
+node_modules/
+
+# Python bytecode
 __pycache__/
-**/__pycache__/
 *.pyc
-.venv/
-**/.venv/
-.uv-cache/
+*.pyo
 
-# Local tooling / machine config
+# prd-os runtime state (per plugins/prd-os/skills/prd-os/SKILL.md: never committed)
+#
+# pr-receipts/ is a MACHINE-LOCAL claim about a machine-local test run (Codex
+# major, PR #269 round 7). It is meaningless to anyone else -- it names a sha and
+# says "the floor was run here" -- and this fleet's unattended jobs commit with
+# `git add -A`, so an unignored receipt directory rides into the public repo and
+# then looks like a receipt everybody agreed to.
+.prd-os/pr-receipts/
+.claude/state/active-prd.json
+.claude/state/active-issue.json
+.claude/state/prdos-stop-gate-firings.json
+
+# Generated standalone plugin builds
+plugins/*/dist/
+/dist/
+
+# Session artifacts (browser automation logs, daily update stamps)
 .playwright-mcp/
-.agents/
-skills-lock.json
-.claude/
+q-system/output/.update-check-*
 
-# HyperFrames render artifacts + heavy composition sources (never committed)
-**/brag-output*/
-**/renders/
-**/.thumbnails/
-**/.waveform-cache/
+# Codex CLI local config. Holds real credentials -- client_b's
+# .codex/config.toml carries an apify-token, which gitleaks correctly refused
+# to let through on 2026-07-25. Machine-local tool config, never repo content.
+.codex/
 
-.codesk
-.fireside/
+# (.claude/state/ moved INTO the kipi-instance-local-stanza above, ASK-605.)
+
+# Generated capability maps (regenerate with capability-map-gen.py; ~5MB, churns
+# on every run). The committed artifact is the digest the overlap pass emits.
+q-system/output/capability-maps/
+.runs/
+
+# Lock files beside the prd-os ledgers. flock targets, recreated on every
+# resolve/reclassify, and they were standing untracked-and-unignored inside a
+# TRACKED directory. sp-a21cb27c predicted an unattended auto-commit would sweep
+# them in; measured 2026-08-14 that is false -- auto-commit.py's NEVER list
+# already refuses any .lock, so system_state_paths returns [] for both. What was
+# left was permanent noise in `git status`, which is its own cost: a status that
+# is never clean is a status nobody reads.
+.prd-os/*.lock
+.prd-os/.judgments.lock
+
+# THE STANZA BETWEEN THESE MARKERS IS SHIPPED TO EVERY INSTANCE (sp-097d2e23).
+# kipi-update-gitignore-block.py parses it out of this file and writes it into
+# each instance's root .gitignore as a managed block. Root .gitignore is not in
+# the updater's sync set, so until 2026-08-14 these rules existed only here --
+# and an instance that does not ignore these paths has git report them, which
+# hands them straight to auto-commit.py (q-system/.q-system/ classifies as
+# "chore", which the fleet sync commits unattended). Five of 22 instances had
+# already committed their own baseline or armed marker, the most recent that
+# same day. Add a path here and every instance gets it on the next update; the
+# writer refuses rather than guessing if these markers ever go missing.
+# >>> kipi-instance-local-stanza >>>
+# .claude/ integrity baseline is INSTANCE-LOCAL (ASK-282). Never commit it:
+# kipi update propagates the skeleton, but each instance regenerates
+# .claude/settings.json from settings-template.json, so a shared baseline can
+# never match and would Slack-page every instance daily.
+q-system/.q-system/claude-integrity-baseline.json
+q-system/.q-system/claude-integrity-baseline.json.lock
+q-system/output/claude-integrity/
+# The armed marker (ASK-291 round 11) is ignored for the SAME reason and it is
+# load-bearing that it stays that way: a committed marker propagates via kipi
+# update, so every fresh instance would claim prior arming, refuse to arm, and
+# Slack-page SECURITY on its first run -- the round-2 outage exactly.
+q-system/.q-system/.claude-integrity-armed
+# Daily update stamps. Pure updater exhaust, and the reason this line moved
+# into the shipped stanza: instances carry hundreds of them, many already
+# committed by the pre-ASK-498 generic-fallback sweep.
+q-system/output/.update-check-*
+# Hook state (stop-gate firings, kb-graph-guard, ...). Session bookkeeping
+# written by hooks on every session, so tracking it churned git on every cycle.
+# Shipped in this stanza, not only ignored here, because root .gitignore does
+# not sync: measured 2026-09-23, three instances carried it TRACKED (committed
+# before the rule reached them), a hook dirtied it every session, and the
+# dirty-tree guard refused all three on every run (ASK-605). kipi-update.sh
+# untracks whatever this stanza ignores; the managed block keeps it untracked.
+.claude/state/
+# <<< kipi-instance-local-stanza <<<
+
+# PR-review scratch trees. 537 of these files were swept into the repo by an
+# unattended `chore: update project files` auto-commit (ec5efddf). Removing them
+# without ignoring the pattern just waits for the next sweep to re-add them.
+.pr*rev*/
+.review-scratch/
+.fable-wt/
+
+# Agent refusal sentinels. These are TRANSIENT and worktree-local: the agent
+# writes one, the worker reads it, labels the issue, and deletes it. Committing
+# one is a live defect, not clutter -- on merge it lands at the root of main, so
+# every worktree cut from main afterwards materializes it at checkout BEFORE any
+# agent runs. The worker then reads a sentinel it did not write and refuses an
+# unrelated issue, carrying the previous issue's reason text into that issue's
+# Linear comment and needs-scope label.
+#
+# Observed on PR #141 (ASK-700): a refusal was written here and swept in by
+# `git add -A`. The ignore is the fix rather than a review checklist -- a path
+# `git add -A` cannot stage cannot be committed by any future agent on any
+# future branch. Asserted by case 13 of test-worker-refusal.sh.
+.sana-needs-scope
+.sana-blocked-capability
+.codex-blocked-capability
+
+# Held lessons are what the client-data gate could NOT clear (ASK-2278). This
+# repo is public; lessons-daily.sh adds the whole lesson-candidates/ dir, so
+# without this rule every held lesson was committed and pushed. They stay on
+# the machine that wrote them. The ledger (.processed.json) is still tracked.
+/lesson-candidates/held-*.md
+
+# Private data that sat in this PUBLIC repo until ASK-2058 (2026-10-22). Untracked,
+# kept on the machine that owns it, and ignored so an auto-commit cannot add it
+# back: a list of real people, and two rollback records of a finished reorg that
+# name client instance paths. (The voice corpus and client run files under
+# q-system/output/ were already covered by the output/** rule.)
+/q-system/my-project/relationships.md
+/scripts/persona-reorg-manifest-consulting.json
+/instance-registry.json.persona-reorg.bak
