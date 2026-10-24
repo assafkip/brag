@@ -205,3 +205,31 @@ q-system/output/.update-check-*
 /q-system/my-project/relationships.md
 /scripts/persona-reorg-manifest-consulting.json
 /instance-registry.json.persona-reorg.bak
+
+# --- brag repo's own ignores (kept when the kipi skeleton was seeded, ASK-3036) ---
+# OS / editor cruft
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+.venv/
+**/.venv/
+.uv-cache/
+
+# Local tooling / machine config
+.playwright-mcp/
+.agents/
+skills-lock.json
+
+# HyperFrames render artifacts + heavy composition sources (never committed)
+**/brag-output*/
+**/renders/
+**/.thumbnails/
+**/.waveform-cache/
+
+.codesk
+.fireside/
+.claude/skills/
