@@ -27,10 +27,15 @@ WHITE = "color=c=white:s=1920x1080:d=4:r=30"
 
 
 def _clip(path, box_x):
-    """White 1920x1080 for 4 s with one 40 by 40 black block at box_x (an ffmpeg expression)."""
+    """White 1920x1080 for 4 s with one 40 by 40 black block at box_x (an ffmpeg expression).
+
+    overlay, not drawbox: drawbox resolves its x once unless the build has the eval option, and
+    this machine's ffmpeg does not have it, so the "moving" clip came out frozen. overlay
+    evaluates x every frame by default.
+    """
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", WHITE,
-                    # eval=frame or drawbox resolves x once and the block never moves
-                    "-vf", f"drawbox=x='{box_x}':y=500:w=40:h=40:color=black:t=fill:eval=frame",
+                    "-f", "lavfi", "-i", "color=c=black:s=40x40:d=4:r=30",
+                    "-filter_complex", f"[0][1]overlay=x='{box_x}':y=500",
                     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", str(path)], check=True)
     return path
 

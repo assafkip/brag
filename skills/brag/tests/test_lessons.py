@@ -209,11 +209,17 @@ def test_readers_check(tmp_path):
     sha = chain_checks.sha256(vid)
     assert chain_checks.readers_check(tmp_path, vid)[0] == "INFO"
     (tmp_path / "rulings.json").write_text(json.dumps({"readers_required": 2}))
-    row = lambda r, v, s=sha: json.dumps({"reader": r, "verdict": v, "why": "x", "video_sha256": s})
+    # cov=False is an old-shaped row: a verdict with no retell coverage. It WARNs rather than
+    # failing, per ruling 38, because every row written before ASK-3036 has that shape.
+    def row(r, v, s=sha, cov=True):
+        d = {"reader": r, "verdict": v, "why": "x", "video_sha256": s}
+        return json.dumps({**d, "retell_matched": 8, "retell_total": 8} if cov else d)
     (tmp_path / "readers.jsonl").write_text(row("a", "STAY") + "\n")
     assert chain_checks.readers_check(tmp_path, vid)[0] == "FAIL"              # one of two
     (tmp_path / "readers.jsonl").write_text(row("a", "STAY") + "\n" + row("b", "STAY") + "\n")
     assert chain_checks.readers_check(tmp_path, vid)[0] == "PASS"
+    (tmp_path / "readers.jsonl").write_text(row("a", "STAY") + "\n" + row("b", "STAY", cov=False) + "\n")
+    assert chain_checks.readers_check(tmp_path, vid)[0] == "WARN"              # judged without the narration
     (tmp_path / "readers.jsonl").write_text(row("a", "STAY") + "\n" + row("b", "LEAVE") + "\n")
     assert chain_checks.readers_check(tmp_path, vid)[0] == "FAIL"
     (tmp_path / "readers.jsonl").write_text(row("a", "STAY", "old") + "\n" + row("b", "STAY", "old") + "\n")
