@@ -1,0 +1,1311 @@
+#!/usr/bin/env python3
+"""Regression tests for launchd-health-check.py (the silent-job-death watchdog).
+
+Covers the two pure decision functions. The launchd end-to-end path (creating a
+failing job, kickstarting it, reading LastExitStatus) is macOS-launchd-specific and
+verified manually on wiring; these tests guard the logic that a refactor could break.
+
+Run: python3 test_launchd_health_check.py   (exit 0 = pass, 1 = fail)
+"""
+import contextlib
+import importlib.util
+import io
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+_spec = importlib.util.spec_from_file_location(
+    "wd", Path(__file__).resolve().parent / "launchd-health-check.py"
+)
+wd = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(wd)
+
+failures = []
+
+
+def check(name, got, want):
+    if got != want:
+        failures.append(f"{name}: got {got!r}, want {want!r}")
+
+
+# normalize_exit: launchctl reports raw wait(2) status; we want the human exit code.
+check("clean zero", wd.normalize_exit(0), 0)
+check("exit 3 encoded (3<<8)", wd.normalize_exit(768), 3)
+check("exit 127 encoded (127<<8)", wd.normalize_exit(32512), 127)
+check("exit 1 encoded (1<<8)", wd.normalize_exit(256), 1)
+check("small value passthrough 3", wd.normalize_exit(3), 3)
+check("small value passthrough 127", wd.normalize_exit(127), 127)
+check("sigkill (signal 9)", wd.normalize_exit(9), 9)  # <256 passes through
+
+# classify_status: the pure decision behind job_status (no launchctl shell).
+# rc != 0 -> the label is not loaded (silently never runs).
+check("not loaded", wd.classify_status(1, ""), ("not_loaded", None))
+# loaded, clean last run.
+check("clean loaded", wd.classify_status(0, '"LastExitStatus" = 0;'), ("ok", 0))
+# loaded, real non-zero exit (exit 1 encoded 1<<8=256) -> failing.
+check("real exit 1 fails", wd.classify_status(0, '"LastExitStatus" = 256;'), ("failing", 1))
+# THE REPRODUCER (scar 2026-07-18): KeepAlive job, LastExitStatus=15 (SIGTERM),
+# live PID present -> benign relaunch, NOT a failure.
+sigterm_live = '"LastExitStatus" = 15;\n\t"PID" = 78511;'
+check("sigterm + live pid = ok", wd.classify_status(0, sigterm_live), ("ok", 0))
+# SIGTERM but NO live pid (dead, not restarted) -> still surfaced.
+check("sigterm no pid still fails", wd.classify_status(0, '"LastExitStatus" = 15;'),
+      ("failing", 15))
+# a real exit(15) is raw 15<<8=3840, decodes to 15, not the SIGTERM raw 15 -> still fails
+# even with a live pid (only the SIGTERM signal signature is carved out).
+check("real exit 15 with pid still fails",
+      wd.classify_status(0, '"LastExitStatus" = 3840;\n\t"PID" = 999;'), ("failing", 15))
+# a crash-loop signal (SIGKILL 9) with a live pid is NOT carved out -> still pages.
+check("sigkill with pid still fails",
+      wd.classify_status(0, '"LastExitStatus" = 9;\n\t"PID" = 999;'), ("failing", 9))
+
+# problems_to_ping: dedupe so a persistently-failing job does not spam every run.
+TTL = wd.FAIL_PING_TTL_SECONDS
+now = 1_000_000
+
+# never-pinged failing job -> ping
+check("never pinged", wd.problems_to_ping([("a", "failing", "exit 127")], {}, now),
+      [("a", "failing", "exit 127")])
+
+# pinged within TTL, same kind -> suppress
+recent = {"a": {"pinged_at": now - 60, "kind": "failing"}}
+check("pinged recently suppressed",
+      wd.problems_to_ping([("a", "failing", "exit 127")], recent, now), [])
+
+# pinged longer ago than TTL -> ping again
+stale = {"a": {"pinged_at": now - TTL - 1, "kind": "failing"}}
+check("stale ping re-fires", wd.problems_to_ping([("a", "failing", "exit 127")], stale, now),
+      [("a", "failing", "exit 127")])
+
+# kind changed (failing -> not_loaded) re-fires even within TTL
+changed = {"a": {"pinged_at": now - 60, "kind": "failing"}}
+check("kind change re-fires",
+      wd.problems_to_ping([("a", "not_loaded", "installed but not running")], changed, now),
+      [("a", "not_loaded", "installed but not running")])
+
+# --- a deliberately paused job is never a ping -------------------------------
+# Scar 2026-07-26: 26 com.cole.* jobs were paused by commenting `com.cole.` out
+# of launchd-watch-prefixes.txt. That can never work -- load_watched_prefixes()
+# only ADDS from that file, so a comment cannot remove a prefix hardcoded in
+# WATCHED_PREFIXES. The pause was real, the silence was not, and one manual run
+# fired 26 false pings at the founder. Recurring false alarms are the mechanism
+# that teaches an operator to ignore the channel, which costs the REAL alert.
+check("a paused job is never pinged",
+      wd.problems_to_ping([("a", "paused", "paused on purpose")], {}, now),
+      [])
+
+check("paused stays silent even after the TTL",
+      wd.problems_to_ping([("a", "paused", "paused on purpose")],
+                          {"a": {"pinged_at": 0, "kind": "paused"}}, now),
+      [])
+
+# ...but a genuinely dark job in the same batch must still get through, or the
+# suppression would hide real rot behind an intentional pause.
+check("a real not_loaded still pings alongside a paused one",
+      wd.problems_to_ping([("paused-one", "paused", "paused on purpose"),
+                           ("dark-one", "not_loaded", "installed but not running")],
+                          {}, now),
+      [("dark-one", "not_loaded", "installed but not running")])
+
+check("a paused label that starts FAILING still pings",
+      wd.problems_to_ping([("a", "failing", "exit 1")], {}, now),
+      [("a", "failing", "exit 1")])
+
+# the ledger reader must ignore comments and blanks, like every other kipi list
+_paused = wd.load_paused_labels()
+check("load_paused_labels returns a set", isinstance(_paused, set), True)
+
+# --- dry-run flag parsing (ASK-181) ------------------------------------------
+# THE REPRODUCER: the old test was `"--dry" in sys.argv`, an exact string match, so
+# `--dry-run` fell through to the LIVE path -- writing state and pinging the
+# founder's phone from what the operator typed as a read-only check. This job's own
+# migration Definition of Ready tells the verifier to run `--dry-run`.
+check("--dry is a dry flag", wd.is_dry_run(["--dry"]), True)
+check("--dry-run is a dry flag", wd.is_dry_run(["--dry-run"]), True)
+check("-n is a dry flag", wd.is_dry_run(["-n"]), True)
+check("no flag carries no dry request", wd.is_dry_run([]), False)
+check("an unrelated flag is not a dry flag", wd.is_dry_run(["--verbose"]), False)
+check("a dry flag anywhere is seen", wd.is_dry_run(["--verbose", "--dry-run"]), True)
+# is_dry_run answers "was a dry flag typed", nothing more. What the script DOES
+# with an unrecognized flag is parse_mode's call, asserted further down -- the
+# review's finding 3 was that no code path enforced the docstring's promise.
+
+# --- findings reach Linear, not only Slack (ASK-181) -------------------------
+# Bar 2 of the job-migration contract: a finding that only ever exists as a Slack
+# line is read once and scrolls away. Linear holds state.
+_probs = [
+    ("com.kipi.alpha", "failing", "exit 127"),
+    ("com.kipi.beta", "not_loaded", "installed but not running"),
+    ("com.cole.gamma", "paused", "paused on purpose"),
+]
+_found = wd.linear_findings(_probs)
+check("paused is never filed", [f["subject"] for f in _found],
+      ["com.kipi.alpha", "com.kipi.beta"])
+check("failing routes to the launchd-failing detector",
+      _found[0]["detector"], "launchd-failing")
+check("not_loaded routes to the launchd-dark detector",
+      _found[1]["detector"], "launchd-dark")
+check("the failing title carries the exit code",
+      _found[0]["title"], "launchd job failing: com.kipi.alpha (exit 127)")
+check("the dark title names the job", _found[1]["title"],
+      "launchd job is dark: com.kipi.beta")
+check("every finding carries a body", all(f.get("body") for f in _found), True)
+
+# The dedup key must be fleet-health-daily.py's key, byte for byte. That job runs
+# the SAME two checks at 08:15; a second key namespace would file a permanent
+# duplicate Linear issue for every finding both jobs see, and Linear issues do not
+# get deleted here.
+_fh_spec = importlib.util.spec_from_file_location(
+    "fh", Path(__file__).resolve().parent / "fleet-health-daily.py"
+)
+_fh = importlib.util.module_from_spec(_fh_spec)
+_fh_spec.loader.exec_module(_fh)
+check("failing key matches fleet-health's",
+      _found[0]["key"], _fh.finding_key("launchd-failing", "com.kipi.alpha"))
+check("dark key matches fleet-health's",
+      _found[1]["key"], _fh.finding_key("launchd-dark", "com.kipi.beta"))
+
+# ...and fleet-health's filer must be able to say who filed it, or every issue
+# this watchdog files claims to come from a job that did not file it.
+import inspect  # noqa: E402 - local to this assertion
+
+check("file_findings accepts a filer", "filer",
+      "filer" if "filer" in inspect.signature(_fh.file_findings).parameters else "MISSING")
+
+# Linear being unreachable must never take the watchdog down -- a watchdog that
+# dies on a network error stops watching launchd, which is the exact silent death
+# it exists to catch. Swap the cached fleet-health module for one that raises.
+class _Boom:
+    @staticmethod
+    def finding_key(detector, subject):
+        return _fh.finding_key(detector, subject)
+
+    @staticmethod
+    def launchd_finding(detector, label, detail=""):
+        return _fh.launchd_finding(detector, label, detail)
+
+    @staticmethod
+    def file_findings(findings, apply, filer=None):
+        raise RuntimeError("linear unreachable")
+
+
+_saved_fh = wd._FLEET_HEALTH
+wd._FLEET_HEALTH = _Boom
+try:
+    _broken = wd.file_linear_findings([("com.kipi.alpha", "failing", "exit 127")])
+finally:
+    wd._FLEET_HEALTH = _saved_fh
+check("a filing error is swallowed, not raised", _broken["created"], 0)
+check("a filing error is counted", _broken["skipped_no_key"], 1)
+
+# Nothing to file must not reach the network at all.
+wd._FLEET_HEALTH = _Boom
+try:
+    _none = wd.file_linear_findings([("com.cole.gamma", "paused", "paused on purpose")])
+finally:
+    wd._FLEET_HEALTH = _saved_fh
+# `owed` rides along on every return path: it is the denominator `unfiled_count`
+# needs, and a path that omitted it would silently fall back to reading one bucket.
+check("a paused-only run files nothing", _none,
+      {"created": 0, "existing": 0, "skipped_no_key": 0, "owed": 0})
+
+# --- a dead filer must not read like a clean run (ASK-181 review, finding 1) --
+# THE REPRODUCER: `file_findings` catches its own network errors and returns
+# {created: 0, existing: 0, skipped_no_key: N}. The report read `created` and
+# `existing` only, so "Linear is unreachable, 2 findings went nowhere" printed the
+# byte-identical line to "the fleet is clean, nothing to file". Every kipi instance
+# without ~/.config/kipi/linear-api-key takes that branch, and this script ships
+# fleet-wide via kipi update. A false all-clear at 3am is the same class of harm as
+# crying wolf -- it is the fleet's own lesson "a zero result must prove it is empty,
+# not broken", which this very job exists to honor.
+
+
+def _fh_stub(created=0, existing=0, unfiled=0, record=None):
+    """A stand-in fleet-health module with a scripted file_findings outcome."""
+
+    class _Stub:
+        @staticmethod
+        def finding_key(detector, subject):
+            return _fh.finding_key(detector, subject)
+
+        # Delegated, never re-implemented: a stub with its own rendering would go
+        # on passing after the two filers drifted apart again, which is the whole
+        # defect (PR #19 round-3 review, major).
+        @staticmethod
+        def launchd_finding(detector, label, detail=""):
+            return _fh.launchd_finding(detector, label, detail)
+
+        @staticmethod
+        def file_findings(findings, apply, filer=None):
+            if record is not None:
+                record.append({"n": len(findings), "apply": apply, "filer": filer})
+            n = len(findings)
+            return {
+                "created": n if created == "all" else created,
+                "existing": n if existing == "all" else existing,
+                "skipped_no_key": n if unfiled == "all" else unfiled,
+            }
+
+    return _Stub
+
+
+_intent_calls = []
+_intent_broken_labels = []
+
+
+def run_capture(problems, fleet_health, dry=False, state=None):
+    """Drive run() with every side-effecting edge stubbed.
+
+    Returns (stdout, stderr, pings, state_writes) so an assertion can read what
+    the operator would actually SEE, not just what the function returned.
+
+    `run_intent_check` is stubbed for the same reason as the other four. Scar
+    (PR #134 review, major): it was left LIVE, so `wd.run(dry)` -- default
+    dry=False, the live path -- loaded launchd-intent-verify.py for real, shelled
+    the operator's actual `launchctl print-disabled`, read ~/Library/LaunchAgents,
+    and WROTE ~/.config/kipi/launchd-intent-state.json. Measured: the state file's
+    mtime changed on every run of this suite. It also leaked into the assertions
+    themselves -- a real drift on the machine would push an extra entry into
+    `pings`, and the ping-count checks below would fail for a reason that has
+    nothing to do with the watchdog. A unit test's verdict must not depend on the
+    founder's launchd state.
+
+    The stub RECORDS its calls rather than swallowing them, so the wiring
+    ("intent runs BEFORE the early return in run()") stays pinned by an assertion
+    instead of by the live call that used to prove it as a side effect.
+    """
+    saved = (wd.discover_problems, wd.load_state, wd.write_state,
+             wd.send_ping, wd._FLEET_HEALTH, wd.run_intent_check)
+    pings, writes = [], []
+    _intent_calls.clear()
+    wd.discover_problems = lambda: (_intent_calls.append("discover"), problems)[1]
+    wd.load_state = lambda: dict(state or {})
+    wd.write_state = lambda s: writes.append(s)
+    wd.send_ping = lambda message: (pings.append(message), True)[1]
+    wd._FLEET_HEALTH = fleet_health
+    wd.run_intent_check = lambda dry_run, broken_labels=None: (
+        _intent_broken_labels.append(broken_labels),
+        _intent_calls.append(f"intent:{dry_run}"))
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            wd.run(dry)
+    finally:
+        (wd.discover_problems, wd.load_state, wd.write_state,
+         wd.send_ping, wd._FLEET_HEALTH, wd.run_intent_check) = saved
+    return out.getvalue(), err.getvalue(), pings, writes
+
+
+_TWO_REAL = [("com.claudedaddy.pinterest", "failing", "exit 127"),
+             ("com.kipi.opp-scan", "not_loaded", "installed but not running")]
+_NOTHING_TO_FILE = [("com.cole.gamma", "paused", "paused on purpose")]
+
+_dead_out = run_capture(_TWO_REAL, _fh_stub(unfiled="all"))[0].strip().splitlines()[-1]
+_empty_out = run_capture(_NOTHING_TO_FILE, _fh_stub())[0].strip().splitlines()[-1]
+_tracked_out = run_capture(_TWO_REAL, _fh_stub(existing="all"))[0].strip().splitlines()[-1]
+
+check("a dead filer does NOT print the same line as a run with nothing to file",
+      _dead_out == _empty_out, False)
+check("a dead filer names how many findings never reached Linear",
+      "unfiled=2" in _dead_out, True)
+check("a clean run reports nothing unfiled", "unfiled=0" in _empty_out, True)
+check("an all-already-tracked run still reports nothing unfiled",
+      "unfiled=0" in _tracked_out, True)
+
+# The layer above the counter: the Slack ping is the only channel the founder
+# actually reads. Fixing the stdout line alone would leave the ping saying "here
+# are 2 problems" while the issues meant to hold them never reached the board.
+# No NEW ping is created -- the ping that already fires carries the truth.
+_dead_pings = run_capture(_TWO_REAL, _fh_stub(unfiled="all"))[2]
+_ok_pings = run_capture(_TWO_REAL, _fh_stub(created="all"))[2]
+check("a dead filer adds no extra ping", len(_dead_pings), 1)
+check("the ping says the findings did not reach Linear",
+      any("NOT filed to Linear: 2" in p for p in _dead_pings), True)
+check("a healthy filer leaves the ping text alone",
+      any("NOT filed" in p for p in _ok_pings), False)
+
+# --- a REFUSED write must not read like a clean run either (PR #19 review, major)
+# THE REPRODUCER: ASK-204 gave `file_findings` per-finding error handling, so a
+# Linear write that fails now RETURNS {..., "errors": N} where it used to raise.
+# This reporter read `skipped_no_key` alone, so a refused write printed the
+# byte-identical line to a clean run AND lost the `[NOT filed to Linear: N]`
+# annotation on the ping -- in the job whose whole purpose is catching silence.
+# Same class as the ASK-181 scar above, one bucket further out.
+
+
+def _fh_stub_shape(record=None, **buckets):
+    """A stand-in emitting the FULL bucket shape `file_findings` returns.
+
+    `_fh_stub` above predates ASK-204 and emits three keys; the real filer emits
+    created/existing/skipped_no_key/updated/reopened/relisted/errors. Reporting
+    has to be proved against the shape production actually produces, and against
+    shapes it does not produce YET -- hence **buckets rather than a fixed list.
+    """
+
+    class _Stub:
+        @staticmethod
+        def finding_key(detector, subject):
+            return _fh.finding_key(detector, subject)
+
+        # Delegated, never re-implemented: a stub with its own rendering would go
+        # on passing after the two filers drifted apart again, which is the whole
+        # defect (PR #19 round-3 review, major).
+        @staticmethod
+        def launchd_finding(detector, label, detail=""):
+            return _fh.launchd_finding(detector, label, detail)
+
+        @staticmethod
+        def file_findings(findings, apply, filer=None):
+            if record is not None:
+                record.append({"n": len(findings), "apply": apply, "filer": filer})
+            outcome = {"created": 0, "existing": 0, "skipped_no_key": 0, "updated": 0,
+                       "reopened": 0, "relisted": 0, "errors": 0}
+            outcome.update(buckets)
+            return outcome
+
+    return _Stub
+
+
+def _last_line(problems, fleet_health):
+    return run_capture(problems, fleet_health)[0].strip().splitlines()[-1]
+
+
+# two findings, one filed and one the write refused
+_rejected_line = _last_line(_TWO_REAL, _fh_stub_shape(created=1, errors=1))
+_clean_line = _last_line(_TWO_REAL, _fh_stub_shape(created=2))
+check("a REFUSED Linear write does not print the same line as a clean run",
+      _rejected_line == _clean_line, False)
+check("a refused write is counted as unfiled", "unfiled=1" in _rejected_line, True)
+# the reviewer's exact shape: EVERY write refused reads byte-for-byte like a run
+# that had nothing to file, because both print filed=0 already-tracked=0.
+check("an all-refused run does not print the same line as a run with nothing to file",
+      _last_line(_TWO_REAL, _fh_stub_shape(errors=2))
+      == _last_line(_NOTHING_TO_FILE, _fh_stub_shape()), False)
+check("a clean run still reports nothing unfiled", "unfiled=0" in _clean_line, True)
+_rejected_pings = run_capture(_TWO_REAL, _fh_stub_shape(created=1, errors=1))[2]
+check("the ping says the board does NOT have the refused finding",
+      any("NOT filed to Linear: 1" in p for p in _rejected_pings), True)
+check("a refused write adds no extra ping", len(_rejected_pings), 1)
+check("a clean run leaves the ping text alone",
+      any("NOT filed" in p for p in run_capture(_TWO_REAL, _fh_stub_shape(created=2))[2]),
+      False)
+
+# A re-filed (`relisted`) finding DID land on the board -- counting it as unfiled
+# would trade this silence for a nightly false alarm, which is the other half of
+# the same failure.
+check("a re-filed finding counts as filed, not unfiled",
+      "unfiled=0" in _last_line(_TWO_REAL, _fh_stub_shape(created=1, relisted=1)), True)
+
+# The layer above this fix: `errors` will not be the last bucket `file_findings`
+# grows. A reporter that lists FAILURE buckets by name goes dark again on the day
+# the next one lands -- which is precisely how this regression happened. So
+# unfiled is owed-minus-LANDED: a bucket this reporter has never been taught
+# about counts as not-filed until someone declares it landed.
+check("a bucket the reporter has never heard of still counts as unfiled",
+      "unfiled=1" in _last_line(_TWO_REAL, _fh_stub_shape(created=1, quarantined=1)), True)
+
+# One layer deeper: if the findings cannot even be BUILT (fleet-health-daily.py
+# missing -- literally the kipi-update rsync --delete scar this watchdog exists
+# for) the outcome is all-zeros, which would print the clean-run line again.
+# `unfiled` has to count the problems that were owed an issue, not the findings
+# that were never constructed.
+# ===========================================================================
+# ONE kipi-key means ONE rendering (PR #19 round-3 review, major)
+# ===========================================================================
+# This script and fleet-health-daily.py file against the SAME key by design
+# (ASK-181). `finding_hash` covers title + body, so two renderings of one key made
+# every alternating run see a stale hash: a Linear rewrite plus a "1 updated ...
+# nothing to do now" Slack line twice a day on a fleet where nothing changed.
+#
+# Driven from ONE fake launchctl answering BOTH readers rather than two
+# hand-built fixtures, because the two encodings of a single machine state are
+# half the defect: `launchctl list` prints a SIGNED status (what fleet-health-daily
+# reads) while `launchctl list <label>` prints the RAW wait status (what this
+# script reads). Measured live 2026-07-27: a SIGKILLed job is `-9` in the column
+# and `"LastExitStatus" = 9`; com.apple.BiomeAgent is `5` and `1280`. A test that
+# fed both sides the same pre-formatted detail would have passed while production
+# titled one issue "(exit -9)" and the other "(exit 9)".
+_PAIR_LABEL = "com.kipi.pairing-demo"
+
+
+class _FakeCompleted:
+    def __init__(self, stdout="", returncode=0):
+        self.stdout, self.returncode, self.stderr = stdout, returncode, ""
+
+
+def _one_fake_machine(list_status, last_exit_status):
+    """`launchctl` for ONE failing job, answering both the bulk and per-label reads."""
+    def run(argv, **_kwargs):
+        if argv[:2] == ["launchctl", "list"] and len(argv) == 2:
+            return _FakeCompleted(f"PID\tStatus\tLabel\n-\t{list_status}\t{_PAIR_LABEL}\n")
+        if argv[:2] == ["launchctl", "list"] and len(argv) == 3:
+            if argv[2] != _PAIR_LABEL:
+                return _FakeCompleted("", 1)
+            return _FakeCompleted(f'\t"LastExitStatus" = {last_exit_status};\n', 0)
+        return _FakeCompleted("", 0)
+    return run
+
+
+def _both_renderings(list_status, last_exit_status):
+    """(fleet-health-daily's finding, this watchdog's finding) for one failing job."""
+    saved_fh, saved_wd = _fh.subprocess.run, wd.subprocess.run
+    _fh.subprocess.run = _one_fake_machine(list_status, last_exit_status)
+    wd.subprocess.run = _one_fake_machine(list_status, last_exit_status)
+    saved_module = wd._FLEET_HEALTH
+    wd._FLEET_HEALTH = _fh
+    try:
+        found = _fh.detect_failing_jobs(None)
+        fleet = dict(found[0]) if found else {}
+        if fleet:
+            fleet["key"] = _fh.finding_key("launchd-failing", fleet["subject"])
+        kind, code = wd.job_status(_PAIR_LABEL)
+        problems = [(_PAIR_LABEL, kind, f"exit {code}")] if kind == "failing" else []
+        watchdog = wd.linear_findings(problems)
+        return fleet, (watchdog[0] if watchdog else {})
+    finally:
+        _fh.subprocess.run, wd.subprocess.run = saved_fh, saved_wd
+        wd._FLEET_HEALTH = saved_module
+
+
+# `1`/`256` is an ordinary exit 1; `-9`/`9` is a SIGKILL, the shape 209 of the 210
+# non-zero rows on this machine actually have.
+for _name, _column, _raw in (("exit 1", "1", 256), ("SIGKILL", "-9", 9)):
+    _fleet_f, _wd_f = _both_renderings(_column, _raw)
+    check(f"{_name}: both scripts produce a finding", bool(_fleet_f and _wd_f), True)
+    check(f"{_name}: both file against the same key",
+          _fleet_f.get("key"), _wd_f.get("key"))
+    check(f"{_name}: both render the same title",
+          _fleet_f.get("title"), _wd_f.get("title"))
+    check(f"{_name}: both render the same body", _fleet_f.get("body"), _wd_f.get("body"))
+    check(f"{_name}: so the staleness hash agrees",
+          _fh.finding_hash(_fleet_f), _fh.finding_hash(_wd_f))
+
+# The consumer, not just the strings: `_refresh_one` is what turns a hash
+# disagreement into a Linear mutation. Hand it an issue carrying the OTHER filer's
+# rendering and it must answer "existing" -- no write, no Slack line.
+_fleet_f, _wd_f = _both_renderings("-9", 9)
+_tracked = {
+    "linear_id": "id-1", "identifier": "ASK-1", "state_type": "unstarted",
+    "team_id": "team-1",
+    "description": _fh.issue_description(_fleet_f["key"], _fleet_f,
+                                         filer="fleet-health-daily.py"),
+}
+check("the watchdog leaves fleet-health-daily's issue alone",
+      _fh._refresh_one(None, _wd_f, False, _tracked, "team-1", "launchd-health-check.py"),
+      "existing")
+_tracked_wd = {
+    "linear_id": "id-1", "identifier": "ASK-1", "state_type": "unstarted",
+    "team_id": "team-1",
+    "description": _fh.issue_description(_wd_f["key"], _wd_f,
+                                         filer="launchd-health-check.py"),
+}
+check("and fleet-health-daily leaves the watchdog's issue alone",
+      _fh._refresh_one(None, _fleet_f, False, _tracked_wd, "team-1",
+                       "fleet-health-daily.py"),
+      "existing")
+
+# Every kind this script files must come through the shared renderer -- driven
+# from the mapping itself, so adding a kind without covering it fails here rather
+# than shipping a second rendering of a shared key.
+for _kind, _detector in wd.LINEAR_DETECTOR_BY_KIND.items():
+    check(f"{_kind} routes to a shared-renderer id",
+          _detector in _fh.LAUNCHD_FINDING_IDS, True)
+    _saved_module = wd._FLEET_HEALTH
+    wd._FLEET_HEALTH = _fh
+    try:
+        _built = wd.linear_findings([(_PAIR_LABEL, _kind, "exit 7")])[0]
+    finally:
+        wd._FLEET_HEALTH = _saved_module
+    _shared = _fh.launchd_finding(_detector, _PAIR_LABEL, "exit 7")
+    check(f"{_kind}: title comes from the shared renderer",
+          _built["title"], _shared["title"])
+    check(f"{_kind}: body comes from the shared renderer",
+          _built["body"], _shared["body"])
+
+# An id nobody taught the renderer must be loud, not an empty body filed under a
+# key the other script also writes.
+try:
+    _fh.launchd_finding("launchd-invented", "com.kipi.x", "exit 1")
+    check("an unknown launchd detector id is refused", False, True)
+except ValueError:
+    check("an unknown launchd detector id is refused", True, True)
+
+
+class _BuildBoom:
+    @staticmethod
+    def finding_key(detector, subject):
+        raise ImportError("no module named fleet-health-daily")
+
+    @staticmethod
+    def launchd_finding(detector, label, detail=""):
+        # Rendering is delegated too now, so the missing-module scar has to be
+        # modelled on the call that actually happens first.
+        raise ImportError("no module named fleet-health-daily")
+
+
+_boom_out, _boom_err, _, _ = run_capture(_TWO_REAL, _BuildBoom)
+check("a findings-build crash reports the problems it could not file",
+      "unfiled=2" in _boom_out.strip().splitlines()[-1], True)
+check("a findings-build crash says why on stderr", "could not be built" in _boom_err, True)
+check("a findings-build crash does not count the paused job",
+      "unfiled=0" in run_capture(_NOTHING_TO_FILE, _BuildBoom)[0], True)
+
+# --- the dry preview must match what the live run does (finding 2) -----------
+# `[dry] would file 2` while the live run files 0 over-states a PERMANENT,
+# undeletable action. The cause was two readers of one input: dry counted the
+# findings it built, live counted what the filer actually created after dedup.
+# One reader now -- the same file_findings, with apply=False.
+_calls = []
+_dry_out, _, _dry_pings, _dry_writes = run_capture(
+    _TWO_REAL, _fh_stub(existing="all", record=_calls), dry=True)
+check("the dry preview does not claim it would file already-tracked findings",
+      "would-file=0" in _dry_out, True)
+check("the dry preview reports what is already tracked",
+      "already-tracked=2" in _dry_out, True)
+check("dry runs the SAME filer, with apply off", [c["apply"] for c in _calls], [False])
+check("dry names itself as the filer", [c["filer"] for c in _calls],
+      ["launchd-health-check.py"])
+check("dry still writes no state", _dry_writes, [])
+check("dry still sends no ping", _dry_pings, [])
+check("dry still previews the ping count", "[dry] would ping 2 job(s)" in _dry_out, True)
+
+# and a dead filer during a dry run is just as visible as during a live one
+check("a dry run against a dead filer says so too",
+      "unfiled=2" in run_capture(_TWO_REAL, _fh_stub(unfiled="all"), dry=True)[0], True)
+
+# --- an unrecognized flag must not arm anything (finding 3) ------------------
+# The docstring claimed this; no code path enforced it. `--dry-run=1`, `--dryrun`
+# and `--dry_run` all fell through to the LIVE path -- the same shape as the
+# original scar (a flag the operator believed was read-only was not).
+for _required in ("parse_mode", "main"):
+    if not hasattr(wd, _required):
+        failures.append(f"{_required}(): not implemented on launchd-health-check.py")
+        setattr(wd, _required, lambda *_a, **_k: None)
+
+check("no flag is live", wd.parse_mode([]), ("live", []))
+check("--dry-run is dry", wd.parse_mode(["--dry-run"]), ("dry", []))
+check("--dry is dry", wd.parse_mode(["--dry"]), ("dry", []))
+check("-n is dry", wd.parse_mode(["-n"]), ("dry", []))
+check("--dry-run=1 refuses instead of arming the live path",
+      wd.parse_mode(["--dry-run=1"]), ("refuse", ["--dry-run=1"]))
+check("--dryrun refuses", wd.parse_mode(["--dryrun"]), ("refuse", ["--dryrun"]))
+check("--dry_run refuses", wd.parse_mode(["--dry_run"]), ("refuse", ["--dry_run"]))
+check("-dry refuses", wd.parse_mode(["-dry"]), ("refuse", ["-dry"]))
+check("an unknown flag NEXT TO a dry flag still refuses -- intent is unknown",
+      wd.parse_mode(["--verbose", "--dry-run"]), ("refuse", ["--verbose"]))
+
+_refuse_out, _refuse_err = io.StringIO(), io.StringIO()
+_saved_run = wd.run
+wd.run = lambda dry: _refuse_out.write("RAN\n")
+try:
+    with contextlib.redirect_stdout(_refuse_out), contextlib.redirect_stderr(_refuse_err):
+        _rc = wd.main(["--dryrun"])
+finally:
+    wd.run = _saved_run
+check("a refused flag never reaches run()", "RAN" in _refuse_out.getvalue(), False)
+check("a refused flag still exits 0 (a watchdog never fails its own job)", _rc, 0)
+check("a refused flag says what IS valid", "--dry-run" in _refuse_err.getvalue(), True)
+
+# --- a crash inside run() must be loud, not silent (finding 4) ---------------
+# `finally: sys.exit(0)` supersedes a propagating exception, so an unhandled crash
+# printed NOTHING and launchd recorded SUCCESS. The watchdog dying silently is the
+# exact failure mode it was built to catch, one level up.
+_crash_err = io.StringIO()
+_saved_run = wd.run
+
+
+def _explode(_dry):
+    raise RuntimeError("fleet-health-daily.py vanished")
+
+
+wd.run = _explode
+try:
+    with contextlib.redirect_stderr(_crash_err):
+        _crash_rc = wd.main([])
+finally:
+    wd.run = _saved_run
+check("a crash still exits 0", _crash_rc, 0)
+check("a crash prints its traceback", "Traceback" in _crash_err.getvalue(), True)
+check("the traceback names the real error",
+      "fleet-health-daily.py vanished" in _crash_err.getvalue(), True)
+
+# --- the key must match what fleet-health's PRODUCERS emit (finding 5) -------
+# Comparing against finding_key() only restates this file's own formula. If
+# fleet-health's dark-job detector ever changed `subject` (label -> label.plist,
+# a plausible "improve the issue" edit), both suites would stay green while the
+# fleet filed TWO permanent Linear issues for one job, forever. So drive the real
+# producers and compare the key each side would actually file.
+class _FakeCompleted:
+    def __init__(self, returncode=0, stdout=""):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+class _FakeSubprocess:
+    """Only the two calls fleet-health's launchd producers make."""
+    TimeoutExpired = subprocess.TimeoutExpired
+
+    @staticmethod
+    def run(cmd, **_kw):
+        if list(cmd) == ["launchctl", "list"]:
+            return _FakeCompleted(0, "PID\tStatus\tLabel\n-\t127\tcom.kipi.alpha\n")
+        return _FakeCompleted(1, "")
+
+
+_fh_saved = (_fh._launchd_labels, _fh._paused_labels, _fh._is_loaded, _fh.subprocess)
+_fh._launchd_labels = lambda: ["com.kipi.beta"]
+_fh._paused_labels = lambda: set()
+_fh._is_loaded = lambda _label: False
+_fh.subprocess = _FakeSubprocess
+try:
+    _produced_dark = _fh.detect_dark_jobs(None)
+    _produced_failing = _fh.detect_failing_jobs(None)
+finally:
+    (_fh._launchd_labels, _fh._paused_labels, _fh._is_loaded, _fh.subprocess) = _fh_saved
+
+check("fleet-health's dark producer emitted the job under test",
+      [f["subject"] for f in _produced_dark], ["com.kipi.beta"])
+check("fleet-health's failing producer emitted the job under test",
+      [f["subject"] for f in _produced_failing], ["com.kipi.alpha"])
+check("the watchdog's dark key equals the key fleet-health's PRODUCER files",
+      _found[1]["key"], _fh.finding_key("launchd-dark", _produced_dark[0]["subject"]))
+check("the watchdog's failing key equals the key fleet-health's PRODUCER files",
+      _found[0]["key"], _fh.finding_key("launchd-failing", _produced_failing[0]["subject"]))
+
+# ...and the detector ids themselves have to exist in fleet-health's registry, or
+# the shared namespace is shared with nothing.
+_registry_ids = {d["id"] for d in _fh.DETECTORS}
+check("every detector the watchdog files under is in fleet-health's registry",
+      sorted(set(wd.LINEAR_DETECTOR_BY_KIND.values()) - _registry_ids), [])
+
+# --- the unit suite must not touch real operator state (PR #134 review, major) -
+# THE REPRODUCER: run_capture() left run_intent_check live, so driving run() from
+# a test loaded launchd-intent-verify.py against the founder's real machine.
+# Measured before the fix: `mtime changed by the unit suite: True` on
+# ~/.config/kipi/launchd-intent-state.json. `wd._INTENT` is the module cache the
+# live path fills, so a None cache after a full run_capture is proof the live
+# path was never entered -- and it goes red the moment the stub is removed.
+run_capture(_TWO_REAL, _fh_stub(created="all"))
+check("run_capture never loads the live intent module", wd._INTENT, None)
+# Discovery now comes FIRST (ASK-1124): the intent check needs the broken labels
+# so it never prints "no declared intent" for a failing job. What this pin
+# protected -- the intent check runs even when discovery finds nothing -- is held
+# by the dry, nothing-to-file run just below.
+check("the intent check still runs, AFTER problems are discovered",
+      _intent_calls[:2], ["discover", "intent:False"])
+run_capture(_NOTHING_TO_FILE, _fh_stub(), dry=True)
+check("dry mode reaches the intent check in dry mode too",
+      _intent_calls[:2], ["discover", "intent:True"])
+
+# --- an undelivered alert must not be recorded as seen (PR #134 review, major) -
+# THE REPRODUCER: run_intent_check() called commit() unconditionally. With Linear
+# filing 0 and no Slack webhook, the consecutive-run counter still advanced, and
+# ping_decision only re-alerts at runs==1 or runs % REPEAT_EVERY_RUNS == 0 -- so
+# one phantom receipt bought 12 silent runs on a real drift. Measured on the
+# shipped code: `commit() called anyway: True`, `consecutive silent runs: 12`.
+_DRIFT = [("com.kipi.drifting", "enabled_but_declared_paused",
+           "intent=disabled, override record=enabled")]
+
+
+def _intent_stub(commits, drift=None):
+    drift = _DRIFT if drift is None else drift
+
+    class _Stub:
+        @staticmethod
+        def check(dry_run=False):
+            due = [(label, kind, detail, 1) for label, kind, detail in drift]
+            # Records the VERDICT it was handed rather than reimplementing the
+            # refusal. The refusal itself is the single writer's, and it is
+            # asserted against the real code in test_launchd_intent_verify.py
+            # section 9. A stub that re-encoded the policy would pass whether or
+            # not run_intent_check told the truth, which is the whole question.
+            return list(drift), due, (len(drift), len(drift)), \
+                lambda delivered=False: commits.append(delivered)
+
+        @staticmethod
+        def linear_findings(findings, finding_key):
+            return [{"subject": label, "title": label, "body": "",
+                     "key": finding_key("launchd-intent-drift", label),
+                     "detector": "launchd-intent-drift"}
+                    for label, _, _ in findings]
+
+        @staticmethod
+        def ping_message(due):
+            return f"launchd intent drift: {len(due)} job(s)"
+
+    return _Stub
+
+
+def intent_capture(fleet_health, delivered, drift=None):
+    """Drive run_intent_check with both delivery channels scripted."""
+    commits = []
+    saved = (wd._INTENT, wd._FLEET_HEALTH, wd.send_ping)
+    wd._INTENT = _intent_stub(commits, drift)
+    wd._FLEET_HEALTH = fleet_health
+    wd.send_ping = lambda message: delivered
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            wd.run_intent_check(dry_run=False)
+    finally:
+        (wd._INTENT, wd._FLEET_HEALTH, wd.send_ping) = saved
+    return commits, err.getvalue()
+
+
+_nowhere, _nowhere_err = intent_capture(_fh_stub(unfiled="all"), delivered=False)
+check("nothing filed and nothing sent -> the writer is told delivery FAILED",
+      _nowhere, [False])
+check("and it says so, instead of failing silently",
+      "NOT delivered" in _nowhere_err, True)
+check("slack alone is enough to record the run",
+      intent_capture(_fh_stub(unfiled="all"), delivered=True)[0], [True])
+check("linear alone is enough to record the run",
+      intent_capture(_fh_stub(created="all"), delivered=False)[0], [True])
+check("the one job in a one-job batch newly filed counts as delivery",
+      intent_capture(_fh_stub(created="all"), delivered=False)[0], [True])
+
+# --- an ALREADY-OPEN issue is not this run's delivery (PR #135 review, major) --
+# THE REPRODUCER: the delivery verdict was computed off LANDED_BUCKETS, the filing-
+# COVERAGE allowlist, which contains `existing`. So a drift whose Linear issue was
+# already open -- the normal state from the second run of any real drift onward --
+# reported delivery on a run where the Slack webhook was dead. Measured on the
+# shipped code: `commit(delivered=True)` with slack=False and existing=1, and the
+# real `ping_decision` then returns nothing for 12 consecutive runs.
+#
+# `existing` means the filer found the issue and changed nothing. Linear sends no
+# notification for a no-op, so nobody was told anything on this run.
+#
+# Both directions, on purpose and with the full bucket shape the real filer emits:
+# a verdict hardcoded to False would pass the first check here and page nobody
+# ever, which is the same defect pointing the other way.
+_stale, _stale_err = intent_capture(_fh_stub_shape(existing=1), delivered=False)
+check("slack dead + the board already had the issue -> NOT delivered",
+      _stale, [False])
+check("and the operator is told, not left reading a silent success",
+      "NOT delivered" in _stale_err, True)
+check("a NEW issue is delivery",
+      intent_capture(_fh_stub_shape(created=1), delivered=False)[0], [True])
+check("a REOPENED issue is delivery",
+      intent_capture(_fh_stub_shape(reopened=1), delivered=False)[0], [True])
+check("an UPDATED issue is delivery",
+      intent_capture(_fh_stub_shape(updated=1), delivered=False)[0], [True])
+check("a RELISTED issue -- it had vanished from Linear -- is delivery",
+      intent_capture(_fh_stub_shape(relisted=1), delivered=False)[0], [True])
+check("an already-open issue plus a live webhook is still delivery",
+      intent_capture(_fh_stub_shape(existing=1), delivered=True)[0], [True])
+# The coverage question keeps its own answer: `existing` still means FILED, so the
+# ping must not claim the issue never reached the board. One list per question is
+# the fix; this is the half that must NOT have changed.
+check("an already-open issue is still counted as filed, not as unfiled",
+      wd.unfiled_count({"owed": 1, "existing": 1}), 0)
+
+# The two lists are a strict subset relationship, asserted so a bucket added
+# upstream cannot drift into delivery unnoticed. LANDED_BUCKETS grew three times
+# already (ASK-204: updated, reopened, relisted). A new one arriving now goes red
+# here until somebody answers which of the two questions it belongs to -- red in
+# the safe direction, since the un-answered default is "not delivery".
+check("every delivering bucket is also a landed bucket",
+      [b for b in wd.DELIVERING_BUCKETS if b not in wd.LANDED_BUCKETS], [])
+check("and the only landed bucket that is not delivery is `existing`",
+      [b for b in wd.LANDED_BUCKETS if b not in wd.DELIVERING_BUCKETS], ["existing"])
+
+# --- a PARTIAL filing is not the batch's delivery (PR #135 review, major) ------
+# THE REPRODUCER: the verdict was `told or delivered`. `told` counts FINDINGS;
+# commit() writes the run counts for every label in the batch from one boolean.
+# So one job landing `created` recorded its neighbours as seen. `file_findings`
+# loops per finding, so part-`created` / part-`existing` (already on the board,
+# Linear notifies nobody) or part-`errors` (that write refused) is the ordinary
+# shape of a multi-job run. Measured on the shipped code with created=1,
+# existing=1 and a dead webhook: commit(delivered=True), and the real
+# ping_decision then returns nothing for 12 consecutive runs for the job nobody
+# was told about.
+#
+# Every fixture in the four prior rounds was a batch of ONE, where a partial
+# outcome cannot occur. That is how this class survived four reviews of this one
+# function, so the batch of TWO is the fixture from here on.
+_TWO_DRIFT = [("com.kipi.fresh", "enabled_but_declared_paused",
+               "intent=disabled, override record=enabled"),
+              ("com.kipi.stale", "disabled_but_declared_running",
+               "intent=enabled, override record=disabled")]
+
+
+def _batch(delivered, **buckets):
+    return intent_capture(_fh_stub_shape(**buckets), delivered=delivered,
+                          drift=_TWO_DRIFT)
+
+
+_partial, _partial_err = _batch(False, created=1, existing=1)
+check("slack dead + only half the batch newly filed -> NOT delivered",
+      _partial, [False])
+check("and the operator is told which half, not just that something failed",
+      "1 of 2" in _partial_err, True)
+check("zero and partial are reported as different states",
+      "PARTLY" in _partial_err, True)
+check("slack dead + one filing REFUSED -> not delivered",
+      _batch(False, created=1, errors=1)[0], [False])
+check("slack dead + one finding never offered to Linear -> not delivered",
+      _batch(False, created=1, skipped_no_key=1)[0], [False])
+# The other direction, so the fix cannot be "a batch never delivers". A verdict
+# hardcoded to False passes every check above and pages nobody, ever.
+check("slack dead + the WHOLE batch newly filed -> that IS delivery",
+      _batch(False, created=2)[0], [True])
+check("slack dead + the whole batch reopened or updated -> that IS delivery",
+      _batch(False, reopened=1, updated=1)[0], [True])
+# One ping_message line covers every due job, so slack is all-or-nothing for the
+# batch by construction -- which is why it is compared against the same
+# denominator instead of being counted.
+check("a live webhook covers the whole batch however Linear went",
+      _batch(True, created=1, existing=1)[0], [True])
+check("a live webhook covers a batch Linear dropped entirely",
+      _batch(True, skipped_no_key=2)[0], [True])
+# The zero case keeps its own wording, so the two states stay distinguishable in
+# the run log after this change.
+_none, _none_err = _batch(False, existing=2)
+check("slack dead + the whole batch already on the board -> not delivered",
+      _none, [False])
+check("nothing delivered still reads as NOT delivered, not as partial",
+      ("NOT delivered" in _none_err, "PARTLY" in _none_err), (True, False))
+
+# send_ping's own verdict: a notifier that cannot reach a channel is not delivery.
+_saved_channel = wd.notify_channel_configured
+try:
+    wd.notify_channel_configured = lambda: False
+    check("no webhook configured -> send_ping reports NOT delivered",
+          wd.send_ping("probe: this must never leave the machine"), False)
+finally:
+    wd.notify_channel_configured = _saved_channel
+
+# --- a CONFIGURED channel is not a delivered one (PR #134 r5; sp-7773af84) ----
+# The check above only covers the case where no channel exists at all. This is
+# the other one: a channel IS configured, the send does not land, and send_ping
+# must still answer False. Both directions are asserted on purpose -- without the
+# delivered case a send_ping hardcoded to False would pass and page nobody, ever.
+#
+# SCAR, sp-7773af84, measured 2026-08-14. This block used to drive a
+# $KIPI_SLACK_WEBHOOK on a refused port. On 2026-08-10 slack-notify.sh's
+# destination changed from Slack to Linear and it stopped reading a webhook at
+# all, so the knob these assertions turned was inert and they were really
+# measuring whether the RUNNER HAD A LINEAR KEY. That cannot be green anywhere:
+# CI (no key) failed `accepts -> delivered`, a keyed machine failed
+# `refuses -> NOT delivered`, and on a keyed machine the "assertion" filed REAL
+# tickets -- ASK-736 repeats, plus ASK-744/ASK-745, all canceled. Main's Skeleton
+# Validation had been red on it since 2026-08-10.
+#
+# The lesson is the one already written into alert-to-linear.py's capture hatch:
+# switching a chokepoint's destination silently invalidates every stub aimed at
+# the old one, and those stubs keep passing their own assertions right up until
+# they write to production. So delivery is now driven through the seam that
+# BELONGS to the current destination -- KIPI_ALERT_CAPTURE, which alert-to-linear
+# built for exactly this -- and never through a webhook. Measured directly before
+# these were written: a writable capture path exits 0 (verdict `delivered`), an
+# unopenable one exits 1 (verdict `send-failed`). Neither touches Linear.
+def _send_ping_verdict(capture_path):
+    """send_ping's answer for one capture destination, environment restored after.
+
+    KIPI_LINEAR_API_URL is popped because the loopback fixture guard in
+    slack-notify.sh would exit 4 before the writer ever runs, which is a
+    different verdict than the one under test here.
+    """
+    saved = {k: os.environ.get(k)
+             for k in ("KIPI_ALERT_CAPTURE", "KIPI_LINEAR_API_URL")}
+    os.environ["KIPI_ALERT_CAPTURE"] = capture_path
+    os.environ.pop("KIPI_LINEAR_API_URL", None)
+    try:
+        return wd.send_ping(_PROBE_MESSAGE)
+    finally:
+        for key, value in saved.items():
+            os.environ.pop(key, None)
+            if value is not None:
+                os.environ[key] = value
+
+
+_PROBE_MESSAGE = "probe: captured locally, never filed (sp-7773af84)"
+
+with tempfile.TemporaryDirectory() as _capdir:
+    # NOT delivered: the writer cannot open its destination, so nothing was
+    # recorded anywhere. The parent directory does not exist and is not created.
+    check("configured channel the alert cannot be written to -> NOT delivered",
+          _send_ping_verdict(os.path.join(_capdir, "absent", "cap.txt")), False)
+
+    # delivered: the write lands. Asserting the boolean alone would pass against
+    # a send_ping that returns True without sending, so the FILE is the evidence.
+    _landed = os.path.join(_capdir, "cap.txt")
+    check("channel that accepts the alert -> delivered",
+          _send_ping_verdict(_landed), True)
+    check("the delivered alert is actually in the destination",
+          _PROBE_MESSAGE in Path(_landed).read_text(encoding="utf-8"), True)
+
+# ---------------------------------------------------------------------------
+# The legacy watchdog may not record a page that never left (PR #134 round 6)
+# ---------------------------------------------------------------------------
+# `run_capture` above stubs send_ping to `True` on every call, which is exactly
+# why this survived five review rounds: the suite had no way to express "the
+# page failed". These drive run() with the verdict as an input instead.
+
+
+def _run_with_verdict(delivered, state=None):
+    """run() live, send_ping scripted to `delivered`. Returns the state written."""
+    saved = (wd.discover_problems, wd.load_state, wd.write_state,
+             wd.send_ping, wd.run_intent_check, wd.file_linear_findings)
+    writes = []
+    wd.discover_problems = lambda: [_ONE_DEAD_JOB]
+    wd.load_state = lambda: dict(state or {})
+    wd.write_state = writes.append
+    wd.send_ping = lambda message: delivered
+    wd.run_intent_check = lambda dry_run, broken_labels=None: None
+    wd.file_linear_findings = lambda problems, apply=True: {
+        "created": 0, "existing": len(problems), "skipped_no_key": 0,
+        "owed": len(problems)}
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            wd.run(False)
+    finally:
+        (wd.discover_problems, wd.load_state, wd.write_state,
+         wd.send_ping, wd.run_intent_check, wd.file_linear_findings) = saved
+    return writes[-1] if writes else {}, err.getvalue()
+
+
+_ONE_DEAD_JOB = ("com.kipi.dead-job", "not_loaded", "installed but not running")
+
+_undelivered, _undelivered_err = _run_with_verdict(False)
+check("undelivered page records no ping time",
+      _undelivered.get(_ONE_DEAD_JOB[0], {}).get("pinged_at"), None)
+check("undelivered page says so on stderr",
+      "no channel took them" in _undelivered_err, True)
+# The consequence, asserted rather than assumed: with nothing recorded, the very
+# next run is due again instead of waiting out the 6h TTL.
+check("next run re-alerts immediately after an undelivered page",
+      [p[0] for p in wd.problems_to_ping([_ONE_DEAD_JOB], _undelivered, now)],
+      [_ONE_DEAD_JOB[0]])
+
+# The delivered direction, or "never record" would pass every assertion above
+# and page the founder on every single run.
+_delivered, _delivered_err = _run_with_verdict(True)
+check("delivered page records a ping time",
+      isinstance(_delivered.get(_ONE_DEAD_JOB[0], {}).get("pinged_at"), int), True)
+check("delivered page prints no undelivered warning",
+      "no channel took them" in _delivered_err, False)
+# `.get` and not `[...]`: a mutant that records nothing must fail this check BY
+# NAME. Subscripting raised KeyError at import instead, which is red for the
+# wrong reason and prints a traceback where a diagnosis belongs.
+check("a delivered page dedups the next run",
+      wd.problems_to_ping(
+          [_ONE_DEAD_JOB], _delivered,
+          _delivered.get(_ONE_DEAD_JOB[0], {}).get("pinged_at", 0) + 60), [])
+
+# Single writer, checked against the SOURCE. Gating on the verdict is only a
+# chokepoint while exactly one function can write the key; a second assignment
+# added later would re-open the hole with every test above still green.
+def _lines_writing_pinged_at(outside_of):
+    """Source lines that STORE pinged_at, excluding the named function's body.
+
+    A write CONSTRUCTS the key (`{"pinged_at": ...}`); a read SUBSCRIPTS it
+    (`prev.get("pinged_at", 0)` in problems_to_ping). Only the write side is
+    the invariant, so the reader side stays free to grow.
+    """
+    src = Path(wd.__file__).read_text().splitlines()
+    inside, offenders = False, []
+    for line in src:
+        if line.startswith("def "):
+            inside = line.startswith(f"def {outside_of}(")
+        if not inside and '{"pinged_at":' in line.replace("{ ", "{"):
+            offenders.append(line.strip())
+    return offenders
+
+
+check("record_pings is the only writer of pinged_at",
+      _lines_writing_pinged_at("record_pings"), [])
+
+
+# =============================================================================
+# 15. The docstring may not outlive its mechanism (codex PR #134, round 7)
+# =============================================================================
+# send_ping's docstring credited a KIPI_NOTIFY_VERDICT_FILE side channel for the
+# delivery verdict. That side channel was built on this branch and DELETED when
+# origin/main's slack-notify.sh exit contract replaced it, so the paragraph
+# described a mechanism present nowhere in the file. Nothing went red: the code
+# was correct and only the explanation was false, which is the failure mode this
+# repo cares about most -- a name is what the next branch will believe.
+#
+# The rule is the bare name, deliberately, not "names it without reading it". No
+# checker can separate a docstring crediting a mechanism as CURRENT from one
+# recording it as deleted HISTORY, and this file needs neither: the removal
+# decision is recorded once, in fable-escalate.notify_send where it was made. So
+# any occurrence here is stale by construction. Split at write time so this
+# assertion does not fail on its own source.
+_DEAD_SIDE_CHANNEL = "KIPI_NOTIFY_VERDICT" + "_FILE"
+check("no docstring credits the deleted verdict-file side channel",
+      _DEAD_SIDE_CHANNEL in Path(wd.__file__).read_text(), False)
+
+
+# Guarded because this file is named test_*.py and pytest IMPORTS such files
+# during collection. A module-level sys.exit() raised SystemExit mid-import,
+# which pytest reports as INTERNALERROR and which aborts the whole run -- so a
+# repo-wide `pytest` sweep died here, on the one file out of fifteen
+# self-tests that exited at import rather than under a __main__ guard.
+#
+# The canonical runner is unchanged: the capability manifest runs this with
+# python3, where __name__ == "__main__" and the exit codes still carry.
+# --- the coverage gap is filed, and is NOT the drift alert's delivery ---------
+# THE REPRODUCER (PR #135 review, round 10, major): "LaunchAgents installed by the
+# repository remain outside intent enforcement because undeclared findings are
+# filtered from both Slack and Linear." Two halves, and the wiring half lives
+# here: `run_intent_check` returns before it files anything when `due` is empty,
+# and `due` is empty on every run whose only findings are coverage -- which is
+# every run on this machine today (47 plists, no manifest file).
+#
+# The second check is the one that keeps rounds 8 and 9 fixed. The coverage
+# roll-up is filed in its OWN file_findings call, so its buckets can never be
+# added into `told`. Appending it to the drift batch instead would have made a
+# coverage issue landing `created` count as the drift alert's delivery: a phantom
+# receipt and 12 silent runs, the exact class this issue has now fixed 4 times.
+_COVERAGE_KEY = "fleet-health/launchd-intent-coverage/coverage"
+# The stub splits the two batches the way launchd-intent-verify.py does.
+_PINGABLE = ("enabled_but_declared_paused", "disabled_but_declared_running")
+_UNDECLARED = [("com.kipi.newly-installed", "undeclared", "no declared intent")]
+
+
+def _cov_intent_stub(commits, findings, due):
+    class _Stub:
+        @staticmethod
+        def check(dry_run=False):
+            return list(findings), list(due), (0, len(findings)), \
+                lambda delivered=False: commits.append(delivered)
+
+        @staticmethod
+        def linear_findings(fs, finding_key):
+            return [{"subject": l, "title": l, "body": "",
+                     "key": finding_key("launchd-intent-drift", l),
+                     "detector": "launchd-intent-drift"}
+                    for l, k, _ in fs if k in _PINGABLE]
+
+        @staticmethod
+        def coverage_findings(fs, cov, finding_key):
+            rolled = [l for l, k, _ in fs if k not in _PINGABLE]
+            if not rolled:
+                return []
+            return [{"subject": "coverage", "title": "coverage",
+                     "body": ", ".join(sorted(rolled)), "key": _COVERAGE_KEY,
+                     "detector": "launchd-intent-coverage"}]
+
+        @staticmethod
+        def ping_message(due_):
+            return f"launchd intent drift: {len(due_)} job(s)"
+
+    return _Stub
+
+
+def _cov_fh_stub(filed, outcomes):
+    """One bucket dict PER CALL, scripted by detector -- what the real filer does.
+
+    A single shared outcome for the whole run would be a fixture built from my own
+    mental model instead of from the producer, which is how round 9's incoherent
+    `created=1, existing=1` against a one-job drift got written and proved nothing.
+    """
+    class _FH:
+        @staticmethod
+        def finding_key(detector, subject):
+            return f"fleet-health/{detector}/{subject}"
+
+        @staticmethod
+        def file_findings(findings, apply, filer=None):
+            detectors = {f["detector"] for f in findings}
+            assert len(detectors) == 1, f"one call mixed detectors: {detectors}"
+            filed.extend(f["key"] for f in findings)
+            return dict(outcomes.get(detectors.pop(), {}))
+
+    return _FH
+
+
+def _cov_capture(findings, due, outcomes, delivered):
+    commits, filed, pings = [], [], []
+    saved = (wd._INTENT, wd._FLEET_HEALTH, wd.send_ping)
+    wd._INTENT = _cov_intent_stub(commits, findings, due)
+    wd._FLEET_HEALTH = _cov_fh_stub(filed, outcomes)
+    wd.send_ping = lambda message: (pings.append(message), delivered)[1]
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            wd.run_intent_check(dry_run=False)
+    finally:
+        (wd._INTENT, wd._FLEET_HEALTH, wd.send_ping) = saved
+    return commits, filed, pings, err.getvalue()
+
+
+_cov_commits, _cov_filed, _cov_pings, _ = _cov_capture(
+    _UNDECLARED, [], {"launchd-intent-coverage": {"created": 1}}, False)
+check("the coverage rollup is filed on a run with no drift due at all",
+      _cov_filed, [_COVERAGE_KEY])
+check("and it pages nobody", _cov_pings, [])
+check("a run with nothing due still records its run counts", len(_cov_commits), 1)
+
+_MIXED = [("com.kipi.drifting", "enabled_but_declared_paused",
+           "intent=disabled, override record=enabled")] + _UNDECLARED
+_MIXED_DUE = [(l, k, d, 1) for l, k, d in _MIXED[:1]]
+_leak_commits, _leak_filed, _leak_pings, _leak_err = _cov_capture(
+    _MIXED, _MIXED_DUE,
+    {"launchd-intent-drift": {"existing": 1},
+     "launchd-intent-coverage": {"created": 1}}, False)
+check("a coverage issue filing cleanly is NOT the drift alert's delivery",
+      _leak_commits, [False])
+check("and the operator is told the alert went nowhere",
+      "NOT delivered" in _leak_err, True)
+check("the drift page still says only what drifted",
+      _leak_pings, ["launchd intent drift: 1 job(s)"])
+check("both the drift finding and the rollup reached the filer",
+      sorted(_leak_filed),
+      [_COVERAGE_KEY, "fleet-health/launchd-intent-drift/com.kipi.drifting"])
+check("the drift's own NEW issue is still delivery",
+      _cov_capture(_MIXED, _MIXED_DUE,
+                   {"launchd-intent-drift": {"created": 1},
+                    "launchd-intent-coverage": {"existing": 1}}, False)[0], [True])
+
+
+# --- an unknown job family is a finding, not silence (ASK-1124) --------------
+# THE REPRODUCER: the watchdog read an ALLOWLIST of families, so a family nobody
+# added was never enumerated at all. Measured 2026-08-29: io.askconsulting. (11
+# jobs, one failing, ASK-1122) and a second owned family (3 jobs) were both unwatched, and
+# the only line the failing job ever produced was the intent check's "no declared
+# intent". Before the fix, the fake machine below yields NO problems at all.
+def _fake_machine(labels, failing, ignore_lines=None):
+    """A temp LaunchAgents dir plus a stubbed job_status. Returns (problems,
+    labels job_status was asked about). Nothing touches the operator's launchd."""
+    asked = []
+    tmp = Path(tempfile.mkdtemp())
+    agents = tmp / "LaunchAgents"
+    agents.mkdir()
+    for label in labels:
+        (agents / f"{label}.plist").write_text("<plist/>")
+    ignore_file = tmp / "ignore.txt"
+    if ignore_lines is not None:
+        ignore_file.write_text("\n".join(ignore_lines) + "\n")
+    saved = (wd.LAUNCH_AGENTS, wd.EXTRA_PREFIXES_FILE, wd.PAUSED_LABEL_FILES,
+             wd.job_status, getattr(wd, "IGNORED_PREFIXES_FILE", None))
+    wd.LAUNCH_AGENTS = agents
+    wd.EXTRA_PREFIXES_FILE = tmp / "absent-extra.txt"
+    wd.PAUSED_LABEL_FILES = ()
+    wd.IGNORED_PREFIXES_FILE = ignore_file
+    wd.job_status = lambda label: (asked.append(label),
+                                   ("failing", failing[label]) if label in failing
+                                   else ("ok", 0))[1]
+    try:
+        return wd.discover_problems(), asked
+    finally:
+        (wd.LAUNCH_AGENTS, wd.EXTRA_PREFIXES_FILE, wd.PAUSED_LABEL_FILES,
+         wd.job_status, wd.IGNORED_PREFIXES_FILE) = saved
+
+
+_UNKNOWN_MACHINE = ["com.kipi.dispatch", "io.newfam.sync", "io.newfam.refresh",
+                    "com.docker.helper", "com.apple.thing",
+                    "com.google.keystone.agent", "com.contourdesign.helper"]
+_unk_problems, _unk_asked = _fake_machine(
+    _UNKNOWN_MACHINE, {"io.newfam.refresh": 1})
+check("an unknown family is reported BY NAME as a finding",
+      [p for p in _unk_problems if p[1] == "unwatched_family"],
+      [("io.newfam.", "unwatched_family",
+        "2 installed job(s) in a family neither watched nor denylisted")])
+check("a failing job in an unknown family is reported as FAILING",
+      ("io.newfam.refresh", "failing", "exit 1") in _unk_problems, True)
+# The vendors ASK-1124 names are the contract; the shipped denylist must hold them.
+_THIRD_PARTY = ("com.apple.", "com.docker.", "com.google.", "com.contourdesign.")
+check("the shipped denylist holds every vendor the issue names",
+      sorted(set(_THIRD_PARTY) - set(getattr(wd, "IGNORED_PREFIXES", ()))), [])
+check("third-party families are never status-checked",
+      sorted(l for l in _unk_asked if l.startswith(_THIRD_PARTY)), [])
+check("and never reported",
+      [p for p in _unk_problems if p[0].startswith(("com.docker", "com.apple",
+                                                    "com.google", "com.contour"))], [])
+check("a watched family is still checked and raises no family finding",
+      ("com.kipi.dispatch" in _unk_asked,
+       any(p[0] == "com.kipi." for p in _unk_problems)), (True, False))
+
+# The local denylist is the bounded way to silence a family that is truly not ours.
+_den_problems, _den_asked = _fake_machine(
+    _UNKNOWN_MACHINE, {"io.newfam.refresh": 1},
+    ignore_lines=["# third party on this host", "io.newfam."])
+check("a locally denylisted family raises no finding and is not checked",
+      (_den_problems, [l for l in _den_asked if l.startswith("io.newfam.")]),
+      ([], []))
+
+# A label with no family part is its own family, and a watched prefix beats the
+# denylist (an explicit watch is the stronger statement).
+check("family_of reduces to the first two components",
+      [getattr(wd, "family_of", lambda _l: None)(l) for l in ("io.askconsulting.ask-crm", "loner", "a.b")],
+      ["io.askconsulting.", "loner", "a.b"])
+
+# No detection regression: the 4 failures known on 2026-08-29 are all still
+# reported, including the one whose family used to be unwatched.
+_KNOWN_FOUR = {"com.ask.parser-watchdog": 1,
+               "io.askconsulting.ask-crm-morning-refresh": 1,
+               "com.cole.daily-social-deadman": 3,
+               "com.cole.delivery-watch": 1}
+_four_problems, _ = _fake_machine(
+    list(_KNOWN_FOUR) + ["com.cole.healthy", "io.askconsulting.healthy"],
+    _KNOWN_FOUR)
+check("all four known failures are still reported",
+      sorted(l for l, k, _ in _four_problems if k == "failing"), sorted(_KNOWN_FOUR))
+
+# The family finding reaches a channel (ping), and is not filed under a detector
+# fleet-health-daily.py does not own.
+check("an unwatched family is due for a ping",
+      wd.problems_to_ping([("io.newfam.", "unwatched_family", "x")], {}, 0),
+      [("io.newfam.", "unwatched_family", "x")])
+check("an unwatched family is not filed under a borrowed detector",
+      "unwatched_family" in wd.LINEAR_DETECTOR_BY_KIND, False)
+
+# 'no declared intent' is never printed for a job the watchdog reports as broken.
+_FAILING_UNDECLARED = [("io.newfam.refresh", "undeclared", "no declared intent"),
+                       ("io.newfam.sync", "undeclared", "no declared intent")]
+
+
+def _intent_stdout(problem_labels):
+    saved = (wd._INTENT, wd._FLEET_HEALTH, wd.send_ping)
+    wd._INTENT = _cov_intent_stub([], _FAILING_UNDECLARED, [])
+    wd._FLEET_HEALTH = _cov_fh_stub([], {})
+    wd.send_ping = lambda message: False
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            wd.run_intent_check(dry_run=True, broken_labels=problem_labels)
+    except TypeError as exc:  # a pre-ASK-1124 signature: report RED, not a crash
+        return f"run_intent_check refused broken_labels: {exc}"
+    finally:
+        (wd._INTENT, wd._FLEET_HEALTH, wd.send_ping) = saved
+    return out.getvalue()
+
+
+_intent_out = _intent_stdout(frozenset({"io.newfam.refresh"}))
+check("'no declared intent' is not printed for a failing job",
+      "io.newfam.refresh -- no declared intent" in _intent_out, False)
+check("and is still printed for a healthy undeclared job",
+      "io.newfam.sync -- no declared intent" in _intent_out, True)
+
+# run() hands the intent check the labels it found broken, so discovery comes
+# first; the intent check still runs before the early return (pinned above by
+# the dry, nothing-to-file run reaching it).
+run_capture(_TWO_REAL, _fh_stub(created="all"))
+check("run() passes the broken labels to the intent check",
+      _intent_broken_labels[-1], frozenset(l for l, _, _ in _TWO_REAL))
+
+
+def _report() -> int:
+    if failures:
+        print("FAIL:")
+        for line in failures:
+            print(f"  - {line}")
+        return 1
+    print("PASS: all launchd-health-check logic checks green")
+    return 0
+
+
+def test_launchd_health_check_logic():
+    """Pytest entry point: same assertions, surfaced as one test."""
+    assert not failures, "launchd-health-check logic failures:\n  - " + \
+        "\n  - ".join(failures)
+
+
+if __name__ == "__main__":
+    sys.exit(_report())

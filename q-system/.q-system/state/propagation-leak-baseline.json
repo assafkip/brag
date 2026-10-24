@@ -1,0 +1,39 @@
+{
+  "_readme": [
+    "ARMED 2026-07-25. Each entry quotes the line that was actually read, then",
+    "says what it is. None is a client name, a deal amount, or a real",
+    "interaction: they are type annotations, docstring parameters, public",
+    "citations, table rows, our own Apify/Gamma tool-cost guidance, and test",
+    "placeholders.",
+    "",
+    "The first armed version used 7 canned sentences made unique by appending a",
+    "fingerprint, which walked around the gate's own anti-bulk-accept guard.",
+    "The guard now strips a trailing `\u2014 path [class] hash` before comparing, so",
+    "that route is closed and these reasons had to be rewritten to survive it.",
+    "",
+    "Reviewable only because the classifier was narrowed first: `name` and",
+    "`date` are no longer fact signals (118 and 90 of 253 findings, not one a",
+    "client). 253 -> 29. Re-baseline with rebaseline_document(); do not hand-edit."
+  ],
+  "blocking_classes": [
+    "case_proof_gap",
+    "client_identity",
+    "dated_interaction",
+    "pricing",
+    "relationship",
+    "source_identity",
+    "sourced_interaction"
+  ],
+  "classifier_sha256": "b7632f10c975a100889322e80471759a8a9e48e2604f655784f1cbc034f3fcb1",
+  "entries": [
+    {
+      "count": 1,
+      "fact_class": "source_identity",
+      "indent": "top",
+      "justification": "read 2026-07-25 in q-system/research/cc-workflow-learnings-2026-06-02.md: `Source: viral article by mvanhorn (author of `last30days`, #3 contributor...` is a citation of a public source or its public author, not a client",
+      "line_sha256": "4e4f1c717ddb2b22e7e18766fbba97bed1052f05486f393b00f529da38bad315",
+      "path": "q-system/research/cc-workflow-learnings-2026-06-02.md"
+    }
+  ],
+  "schema_version": 1
+}

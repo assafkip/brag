@@ -1,0 +1,9 @@
+{
+  "name": "kipi-notebooklm",
+  "version": "0.1.0",
+  "description": "NotebookLM MCP wrapper. Drives a real Chrome via Patchright to query NotebookLM notebooks, ingest sources, generate audio overviews. Personal gmail account profile.",
+  "author": { "name": "Assaf Kipnis", "email": "assaf@ktlystlabs.com" },
+  "repository": "https://github.com/assafkip/kipi-system",
+  "license": "MIT",
+  "mcpServers": "./.mcp.json"
+}
